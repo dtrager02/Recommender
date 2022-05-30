@@ -7,6 +7,8 @@ from scipy.sparse.linalg import spsolve
 from time import perf_counter
 import sqlite3
 import pandas as pd
+import numba
+import csr 
 class ExplicitMF():
     def __init__(self,  
                  n_factors=40, 
@@ -64,23 +66,30 @@ class ExplicitMF():
             #np.random.shuffle(self.samples.values)
             self.n_users = self.samples["username"].max() + 1
             self.n_items = self.samples["anime_id"].max() + 1
+
             #self.train_samples = self.samples.iloc[0:int(self.samples.shape[0]*.8),:]
-            self.ratings = sparse.coo_matrix((self.samples["score"], (self.samples["username"], self.samples["anime_id"]))).tocsc()
-            sparse.save_npz('sparse_matrix.npz', self.ratings)
-            start = perf_counter()
-            self.ratings = sparse.load_npz("sparse_matrix.npz")
+            
+            # self.ratings = sparse.coo_matrix((self.samples["score"], (self.samples["username"], self.samples["anime_id"]))).tocsc().astype("float32")
+            # sparse.save_npz('sparse_matrix.npz', self.ratings)
+            # start = perf_counter()
+            # self.ratings = sparse.load_npz("sparse_matrix.npz")
+            
+            self.ratings = csr.CSR.from_coo(self.samples["username"], self.samples["anime_id"],self.samples["score"],rpdtype=np.float32)
+             
             print(f"Done loading samples from npz file in {perf_counter()-start} s.")
             #self.test_samples = self.samples.iloc[int(self.samples.shape[0]*.8):,:]
             #print(f"# of train samples:{self.train_samples.shape[0]}\n# of test samples:{self.test_samples.shape[0]}")
         except (Exception) as e:
             print("No database loaded\n")
             print(e)
-    def als_step(self,
+    #"(float32[:,:],float32[:,:],float32[:,:],float32,str)"        
+    #@numba.jit(numba.float32[:,:](numba.float32[:,:],numba.float32[:,:],numba.float32[:,:],numba.float32,numba.typeof('a')),nopython=False,cache=True)
+    def als_step(
                  latent_vectors,
                  fixed_vecs,
                  ratings,
                  _lambda,
-                 type='user'):
+                 type):
         """
         One of the two ALS steps. Solve for the latent vectors
         specified by type.
@@ -121,75 +130,11 @@ class ExplicitMF():
                 latent_vectors[i, :] = solve(A,b)
         return latent_vectors
 
-    def als_step2(self,
-                 latent_vectors,
-                 fixed_vecs,
-                 ratings,
-                 _lambda,
-                 type='user'):
-        num_solve = self.n_users if type=="user" else self.n_items
-        num_fixed = fixed_vecs.shape[0]
-        YTY = fixed_vecs.T.dot(fixed_vecs)
-        
-        eye = sparse.eye(num_fixed).tocsr()
-        lambda_eye = _lambda * sparse.eye(self.n_factors).tocsr()
-        solve_vecs = np.zeros((num_solve, self.n_factors))
-
-        #t = perf_counter()
-        for i in range(num_solve):
-            if type=="user":
-                counts_i = ratings[i].toarray()
-            else:
-                counts_i = ratings[:, i].T.toarray()
-            CuI = sparse.diags(counts_i, [0]).tocsr()
-            print("1",CuI.shape)
-            #pu = counts_i.copy()
-            #pu[np.where(pu != 0)] = 1.0
-            YTCuIY = fixed_vecs.T.dot(CuI)#.dot(fixed_vecs)
-            print("3",YTCuIY.shape)
-            YTCupu = fixed_vecs.T.dot(CuI + eye)#.dot(counts_i.T)
-            print("2",YTCupu.shape)
-            xu = spsolve(YTY + YTCuIY + lambda_eye, YTCupu)
-            solve_vecs[i] = xu
-            # if i % 10000 == 0:
-            #     print ('Solved %i vecs in %d seconds' % (i, perf_counter() - t))
-            #     t = time.time()
-            return solve_vecs
-        
-    def als_step3(self,
-                 latent_vectors,
-                 fixed_vecs,
-                 ratings,
-                 _lambda,
-                 type='user'):
-        """
-        One of the two ALS steps. Solve for the latent vectors
-        specified by type.
-        """
-        if type == 'user':
-            # Precompute
-            YTY = np.matmul(fixed_vecs.T,fixed_vecs)
-            lambdaI = np.eye(YTY.shape[0]) * _lambda
-
-            for u in range(latent_vectors.shape[0]):
-                #print((YTY + lambdaI).shape,np.matmul(ratings[u,:].toarray()[0],fixed_vecs).shape)
-                latent_vectors[u, :] = solve(YTY + lambdaI, 
-                                             np.matmul(ratings[u, :].toarray().reshape((-1,)),fixed_vecs))
-        elif type == 'item':
-            # Precompute
-            XTX = np.matmul(fixed_vecs.T,fixed_vecs)
-            lambdaI = np.eye(XTX.shape[0]) * _lambda
-            
-            for i in range(latent_vectors.shape[0]):
-                #print((XTX + lambdaI).shape,ratings[:, i].toarray().reshape((-1,)).shape,fixed_vecs.shape)
-                latent_vectors[i, :] = solve(XTX + lambdaI, 
-                                             np.matmul(ratings[:, i].toarray().reshape((-1,)),fixed_vecs))
-        return latent_vectors
     def train(self, n_iter=5):
         """ Train model for n_iter iterations from scratch."""
         # initialize latent vectors
-        self.user_vecs = np.random.random((self.n_users, self.n_factors))
-        self.item_vecs = np.random.random((self.n_items, self.n_factors))
+        self.user_vecs = np.random.random((self.n_users, self.n_factors)).astype("float32")
+        self.item_vecs = np.random.random((self.n_items, self.n_factors)).astype("float32")
         
         self.partial_train(n_iter)
     
@@ -202,12 +147,12 @@ class ExplicitMF():
         while ctr <= n_iter:
             # if ctr % 10 == 0 and self._v:
             #     print(f'\tcurrent iteration: {ctr}')
-            self.user_vecs = self.als_step(self.user_vecs, 
+            self.user_vecs = ExplicitMF.als_step(self.user_vecs, 
                                            self.item_vecs, 
                                            self.ratings, 
                                            self.user_reg, 
                                            type='user')
-            self.item_vecs = self.als_step(self.item_vecs, 
+            self.item_vecs = ExplicitMF.als_step(self.item_vecs, 
                                            self.user_vecs, 
                                            self.ratings, 
                                            self.item_reg, 
@@ -290,7 +235,9 @@ class ExplicitMF():
             iter_diff = n_iter
 
 if __name__ == "__main__":
+    numba.warnings.simplefilter('ignore', category=numba.errors.NumbaDeprecationWarning)
+    numba.warnings.simplefilter('ignore', category=numba.errors.NumbaPendingDeprecationWarning)
     MF_ALS = ExplicitMF(n_factors=40, user_reg=0.01, item_reg=0.01)
     MF_ALS.link_db("./animeDB2.sqlite3")
-    MF_ALS.load_samples(10**6)
-    #MF_ALS.train()
+    MF_ALS.load_samples(10**5)
+    MF_ALS.train()

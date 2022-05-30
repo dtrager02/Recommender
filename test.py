@@ -1,5 +1,6 @@
 import numpy as np
 import time
+import lenskit
 # a = np.ones((40)).reshape(10,4)
 # b = np.arange(10)[:,None]
 # print(np.sum(b*a,axis=0))
@@ -11,14 +12,10 @@ b = np.arange(40)
 # l = np.arange(95)
 # for i in range(0,len(l),10):
 #     print(l[i:i+10])
-sparse_arr = sparse.rand(5,5,density=.3,random_state=5).tocsc()
+sparse_arr = sparse.rand(5,5,density=.3,random_state=5).tocsr()
 print(sparse_arr.toarray())
 #nz = sparse_arr.nonzero().T
 #temp = np.argwhere(nz[:,0]==2)
-
-
-
-
 start = time.perf_counter()
 print(sparse_arr.tolil().data)
 print(time.perf_counter()-start)
@@ -26,6 +23,8 @@ start = time.perf_counter()
 for i in range(5):
     sparse_arr[i].nonzero()
 print(time.perf_counter()-start)
+sparse_arr = lenskit.matrix.csr_from_scipy(sparse_arr)
+
 def als_step(self,
                  latent_vectors,
                  fixed_vecs,
