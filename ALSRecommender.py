@@ -66,28 +66,30 @@ class ExplicitMF():
             #np.random.shuffle(self.samples.values)
             self.n_users = self.samples["username"].max() + 1
             self.n_items = self.samples["anime_id"].max() + 1
-
+            drop_indices = np.random.choice(self.samples.index,size=int(self.samples.shape[0]/10),replace=False)
+            self.test_samples = self.samples.iloc[drop_indices,:].to_numpy()
+            self.samples = self.samples[~self.samples.index.isin(drop_indices)]
             #self.train_samples = self.samples.iloc[0:int(self.samples.shape[0]*.8),:]
-            
+            print(f"# of train samples: {self.samples.shape[0]}, # of test samples: {self.test_samples.shape[0]}")
             # self.ratings = sparse.coo_matrix((self.samples["score"], (self.samples["username"], self.samples["anime_id"]))).tocsc().astype("float32")
             # sparse.save_npz('sparse_matrix.npz', self.ratings)
             # start = perf_counter()
             # self.ratings = sparse.load_npz("sparse_matrix.npz")
             
-            self.ratings = csr.CSR.from_coo(self.samples["username"], self.samples["anime_id"],self.samples["score"],rpdtype=np.float32)
+            self.ratings = csr.CSR.from_coo(self.samples["username"].to_numpy(), self.samples["anime_id"].to_numpy(),self.samples["score"].to_numpy())
              
             print(f"Done loading samples from npz file in {perf_counter()-start} s.")
             #self.test_samples = self.samples.iloc[int(self.samples.shape[0]*.8):,:]
             #print(f"# of train samples:{self.train_samples.shape[0]}\n# of test samples:{self.test_samples.shape[0]}")
         except (Exception) as e:
             print("No database loaded\n")
-            print(e)
-    #"(float32[:,:],float32[:,:],float32[:,:],float32,str)"        
-    #@numba.jit(numba.float32[:,:](numba.float32[:,:],numba.float32[:,:],numba.float32[:,:],numba.float32,numba.typeof('a')),nopython=False,cache=True)
+            print(e.with_traceback())
+    #numba.float32[:,:](numba.float32[:,:],numba.float32[:,:],numba.float32[:,:],numba.float32,numba.typeof('a'))      
+    @numba.njit(cache=True,parallel=True,fastmath=True)
     def als_step(
                  latent_vectors,
                  fixed_vecs,
-                 ratings,
+                 ratings : csr.CSR,
                  _lambda,
                  type):
         """
@@ -98,34 +100,26 @@ class ExplicitMF():
         lambdaI = np.eye(temp_fixed_vecs.shape[1]) * _lambda
         if type == 'user':
             # Precompute
-            for u in range(0,latent_vectors.shape[0]):
-                row_index = u%5000
-                if row_index == 0:
-                    nonzero_items = ratings[u:u+5000,:].tolil().rows
-                #print(ratings[0,:].toarray().reshape((-1,)).shape,fixed_vecs.shape,ratings.shape)
-                #nonzero_items = ratings[u,:].nonzero().reshape((-1,))[0]
-                fv = temp_fixed_vecs[nonzero_items[row_index],:]
-                #print(nonzero_items.shape,temp_fixed_vecs.shape)
-                YTY = np.matmul(fv.T,fv)
+            for u in numba.prange(0,latent_vectors.shape[0]):
+                nonzero_items = ratings.row_cs(u)
+                fv = temp_fixed_vecs[nonzero_items,:]
+
+                YTY = (fv.T).dot(fv)
                 A = YTY + lambdaI
-                b = ratings[u,nonzero_items[row_index]].dot(fv)[0]
-                #print(ratings[u,nonzero_items[row_index]].shape,b.shape)
-                #b = np.matmul(ratings[u, nonzero_items[row_index]].toarray().reshape((-1,)),fv)
-                #print((YTY + lambdaI).shape,np.matmul(ratings[u,:].toarray()[0],fixed_vecs).shape)
+                b = ratings.row(u)[nonzero_items].dot(fv)
+
                 latent_vectors[u, :] = solve(A, b)
         elif type == 'item':
-            ratings_T = ratings.T
-            for i in range(latent_vectors.shape[0]):
-                row_index = i%5000
-                if row_index == 0:
-                    nonzero_items = ratings_T[i:i+5000,:].tolil().rows
+            ratings_T = ratings.transpose()
+            for i in numba.prange(latent_vectors.shape[0]):
+                nonzero_items = ratings_T.row_cs(i)
                 #print(ratings[0,:].toarray().reshape((-1,)).shape,fixed_vecs.shape,ratings.shape)
                 #nonzero_items = np.nonzero(ratings[:,i].toarray().reshape((-1,)))[0]
-                fv = temp_fixed_vecs[nonzero_items[row_index],:]
+                fv = temp_fixed_vecs[nonzero_items,:]
                 #print(nonzero_items.shape,temp_fixed_vecs.shape)
-                XTX = np.matmul(fv.T,fv)
+                XTX = (fv.T).dot(fv)
                 A = XTX + lambdaI
-                b = ratings_T[i,nonzero_items[row_index]].dot(fv)[0] #(1xm)(mxd)
+                b = ratings_T.row(i)[nonzero_items].dot(fv) #(1xm)(mxd)
                 #print(ratings_T[i,nonzero_items[row_index]].shape,b.shape)
                 latent_vectors[i, :] = solve(A,b)
         return latent_vectors
@@ -133,8 +127,8 @@ class ExplicitMF():
     def train(self, n_iter=5):
         """ Train model for n_iter iterations from scratch."""
         # initialize latent vectors
-        self.user_vecs = np.random.random((self.n_users, self.n_factors)).astype("float32")
-        self.item_vecs = np.random.random((self.n_items, self.n_factors)).astype("float32")
+        self.user_vecs = np.random.random((self.n_users, self.n_factors)).astype("float64")
+        self.item_vecs = np.random.random((self.n_items, self.n_factors)).astype("float64")
         
         self.partial_train(n_iter)
     
@@ -159,32 +153,18 @@ class ExplicitMF():
                                            type='item')
             ctr += 1
             if ctr % 2:
-                print("Iteration: %d ; train error = %.4f" % (ctr, self.mse()))
+                print("Iteration: %d ; train error = %.4f" % (ctr, ExplicitMF.mse(self.samples.to_numpy(),self.user_vecs,self.item_vecs)))
+                print("Threading layer chosen: %s" % numba.threading_layer())
+    @numba.njit(cache=True,parallel=True,fastmath=True)
+    def mse(samples,user_vecs,item_vecs): # samples format : user,item,rating
+        test_errors = np.zeros(samples.shape[0])
+        for i in numba.prange(samples.shape[0]):
+            user = samples[i][0]
+            item = samples[i][1]
+            prediction = user_vecs[user, :].dot(item_vecs[item, :].T)
+            test_errors[i] = samples[i][2] - prediction
+        return np.sqrt(np.sum(np.square(test_errors))/test_errors.shape[0])
     
-    def mse(self,test=False):
-        train_errors, test_errors = [],[]
-        if test:
-            for i, j, r in self.test_samples.values:
-                prediction = self.predict(i, j)
-                test_errors.append(r - prediction)
-            test_errors = np.array(test_errors)
-            return np.sqrt(np.sum(np.square(test_errors))/test_errors.shape[0])
-        
-        predictions = self.samples.apply(
-            lambda x:self.user_vecs[x[0], :].dot(self.item_vecs[x[1], :].T)
-            ,axis=1)
-        train_errors = self.samples["score"]-predictions
-        return np.sqrt(np.sum(np.square(train_errors))/train_errors.shape[0])
-    
-    def predict_all(self):
-        """ Predict ratings for every user and item. """
-        predictions = np.zeros((self.user_vecs.shape[0], 
-                                self.item_vecs.shape[0]))
-        for u in range(self.user_vecs.shape[0]):
-            for i in range(self.item_vecs.shape[0]):
-                predictions[u, i] = self.predict(u, i)
-                
-        return predictions
     def predict(self, u, i):
         """ Single user and item prediction. """
         return self.user_vecs[u, :].dot(self.item_vecs[i, :].T)
@@ -239,5 +219,5 @@ if __name__ == "__main__":
     numba.warnings.simplefilter('ignore', category=numba.errors.NumbaPendingDeprecationWarning)
     MF_ALS = ExplicitMF(n_factors=40, user_reg=0.01, item_reg=0.01)
     MF_ALS.link_db("./animeDB2.sqlite3")
-    MF_ALS.load_samples(10**5)
+    MF_ALS.load_samples(10**6)
     MF_ALS.train()
