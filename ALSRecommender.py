@@ -67,7 +67,7 @@ class ExplicitMF():
             self.n_users = self.samples["username"].max() + 1
             self.n_items = self.samples["anime_id"].max() + 1
             drop_indices = np.random.choice(self.samples.index,size=int(self.samples.shape[0]/10),replace=False)
-            self.test_samples = self.samples.iloc[drop_indices,:].to_numpy()
+            self.test_samples = self.samples.iloc[drop_indices,:]
             self.samples = self.samples[~self.samples.index.isin(drop_indices)]
             #self.train_samples = self.samples.iloc[0:int(self.samples.shape[0]*.8),:]
             print(f"# of train samples: {self.samples.shape[0]}, # of test samples: {self.test_samples.shape[0]}")
@@ -105,7 +105,7 @@ class ExplicitMF():
                 fv = temp_fixed_vecs[nonzero_items,:]
 
                 YTY = (fv.T).dot(fv)
-                A = YTY + lambdaI
+                A = YTY + lambdaI*(fv.shape[0]+1)
                 b = ratings.row(u)[nonzero_items].dot(fv)
 
                 latent_vectors[u, :] = solve(A, b)
@@ -118,13 +118,13 @@ class ExplicitMF():
                 fv = temp_fixed_vecs[nonzero_items,:]
                 #print(nonzero_items.shape,temp_fixed_vecs.shape)
                 XTX = (fv.T).dot(fv)
-                A = XTX + lambdaI
+                A = XTX + lambdaI*(fv.shape[0]+1)
                 b = ratings_T.row(i)[nonzero_items].dot(fv) #(1xm)(mxd)
                 #print(ratings_T[i,nonzero_items[row_index]].shape,b.shape)
                 latent_vectors[i, :] = solve(A,b)
         return latent_vectors
 
-    def train(self, n_iter=5):
+    def train(self, n_iter=30):
         """ Train model for n_iter iterations from scratch."""
         # initialize latent vectors
         self.user_vecs = np.random.random((self.n_users, self.n_factors)).astype("float64")
@@ -155,6 +155,7 @@ class ExplicitMF():
             if ctr % 2:
                 print("Iteration: %d ; train error = %.4f" % (ctr, ExplicitMF.mse(self.samples.to_numpy(),self.user_vecs,self.item_vecs)))
                 print("Threading layer chosen: %s" % numba.threading_layer())
+        print("Test error = %.4f" % (ExplicitMF.mse(self.test_samples.to_numpy(),self.user_vecs,self.item_vecs)))
     @numba.njit(cache=True,parallel=True,fastmath=True)
     def mse(samples,user_vecs,item_vecs): # samples format : user,item,rating
         test_errors = np.zeros(samples.shape[0])
@@ -174,50 +175,12 @@ class ExplicitMF():
         pred = pred[actual.nonzero()].flatten()
         actual = actual[actual.nonzero()].flatten()
         return mean_squared_error(pred, actual)
-    def calculate_learning_curve(self, iter_array, test):
-        """
-        Keep track of MSE as a function of training iterations.
-        
-        Params
-        ======
-        iter_array : (list)
-            List of numbers of iterations to train for each step of 
-            the learning curve. e.g. [1, 5, 10, 20]
-        test : (2D ndarray)
-            Testing dataset (assumed to be user x item).
-        
-        The function creates two new class attributes:
-        
-        train_mse : (list)
-            Training data MSE values for each value of iter_array
-        test_mse : (list)
-            Test data MSE values for each value of iter_array
-        """
-        iter_array.sort()
-        self.train_mse =[]
-        self.test_mse = []
-        iter_diff = 0
-        for (i, n_iter) in enumerate(iter_array):
-            if self._v:
-                print (f'Iteration: {n_iter}')
-            if i == 0:
-                self.train(n_iter - iter_diff)
-            else:
-                self.partial_train(n_iter - iter_diff)
 
-            predictions = self.predict_all()
-
-            self.train_mse += [ExplicitMF.get_mse(predictions, self.ratings)]
-            self.test_mse += [ExplicitMF.get_mse(predictions, test)]
-            if self._v:
-                print( 'Train mse: ' + str(self.train_mse[-1]))
-                print ('Test mse: ' + str(self.test_mse[-1]))
-            iter_diff = n_iter
 
 if __name__ == "__main__":
     numba.warnings.simplefilter('ignore', category=numba.errors.NumbaDeprecationWarning)
     numba.warnings.simplefilter('ignore', category=numba.errors.NumbaPendingDeprecationWarning)
-    MF_ALS = ExplicitMF(n_factors=40, user_reg=0.01, item_reg=0.01)
+    MF_ALS = ExplicitMF(n_factors=80, user_reg=0.05, item_reg=0.05)
     MF_ALS.link_db("./animeDB2.sqlite3")
-    MF_ALS.load_samples(10**6)
+    MF_ALS.load_samples(10**7)
     MF_ALS.train()
