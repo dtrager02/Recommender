@@ -1,4 +1,6 @@
 #sbatch -N1 -n1 --gpus=1 --mem-per-gpu=8192 --ntasks=1 --cpus-per-task=16  --constraint=g start.sub
+#sacct  --format="JobID,Elapsed,CPUTime,MaxRSS,AveRSS"
+#tail -f slurm-146258.out
 from numpy.linalg import solve
 from sklearn.metrics import mean_squared_error
 import numpy as np
@@ -77,7 +79,7 @@ class ExplicitMF():
             # self.ratings = sparse.load_npz("sparse_matrix.npz")
             
             self.ratings = csr.CSR.from_coo(self.samples["username"].to_numpy(), self.samples["anime_id"].to_numpy(),self.samples["score"].to_numpy())
-             
+            #print(self.ratings.rowptrs)
             print(f"Done loading samples from npz file in {perf_counter()-start} s.")
             #self.test_samples = self.samples.iloc[int(self.samples.shape[0]*.8):,:]
             #print(f"# of train samples:{self.train_samples.shape[0]}\n# of test samples:{self.test_samples.shape[0]}")
@@ -165,22 +167,69 @@ class ExplicitMF():
             prediction = user_vecs[user, :].dot(item_vecs[item, :].T)
             test_errors[i] = samples[i][2] - prediction
         return np.sqrt(np.sum(np.square(test_errors))/test_errors.shape[0])
+    @numba.njit(cache=True)
+    def add_users_to_sparse(user_data,ratings:csr.CSR):
+        # print(self.ratings.colinds)
+        # print(self.ratings.values[77:100])
+        values_ = user_data[:,2]
+        col_idx = user_data[:,1]
+        offset = ratings.nnz
+        rowptrs = np.concatenate((ratings.rowptrs,np.array([offset+values_.shape[0]])))
+        colinds = np.concatenate((ratings.colinds,col_idx))
+        values = np.concatenate((ratings.values,values_))
+        print(colinds.shape,values.shape)
+        nrows = ratings.nrows+1
+        ncols = np.unique(colinds).shape[0]
+        nnz = ratings.nnz+values.shape[0]
+        ratings_new = csr.create(nrows, ncols, nnz, rowptrs, colinds, values)
+        print(ratings_new.row_cs(ratings_new.nrows-1))
+        print(ratings_new.row_vs(ratings_new.nrows-1))
+        #print(ratings_new.row(ratings_new.nrows-1).nonzero())
+        return ratings_new, ratings
+
+    def update_existing_sparse_ratings(user_data,ratings:csr.CSR):
+        # print(self.ratings.colinds)
+        # print(self.ratings.values[77:100])
+        values = np.copy(ratings.values)
+        colinds = np.copy(ratings.colinds)
+        rowptrs = np.copy(ratings.rowptrs)
+        for i in range(user_data.shape[0]):
+            value = user_data[i,2]
+            col_idx = user_data[i,1]
+            user = user_data[i,0]
+            
+            colinds=  np.concatenate((colinds[:rowptrs[user]],
+                                      np.array([col_idx]),
+                                      colinds[rowptrs[user]:]))
+            values =  np.concatenate((values[:rowptrs[user]],
+                                      np.array([value]),
+                                      values[rowptrs[user]:]))
+            rowptrs[user+1:] += 1
+        nrows = ratings.nrows
+        ncols = np.max(colinds)+1
+        nnz = colinds.shape[0]
+        ratings_new = csr.create(nrows, ncols, nnz, rowptrs, colinds, values)
+        print(ratings_new.row_cs(70))
+        print(ratings_new.row_vs(70))
+        print(ratings_new.row(70).nonzero())
+        print(ratings_new.ncols)
+        return ratings_new, ratings
+    
     
     def predict(self, u, i):
         """ Single user and item prediction. """
         return self.user_vecs[u, :].dot(self.item_vecs[i, :].T)
     
-    def get_mse(pred, actual):
-        # Ignore nonzero terms.
-        pred = pred[actual.nonzero()].flatten()
-        actual = actual[actual.nonzero()].flatten()
-        return mean_squared_error(pred, actual)
-
 
 if __name__ == "__main__":
     numba.warnings.simplefilter('ignore', category=numba.errors.NumbaDeprecationWarning)
     numba.warnings.simplefilter('ignore', category=numba.errors.NumbaPendingDeprecationWarning)
     MF_ALS = ExplicitMF(n_factors=80, user_reg=0.05, item_reg=0.05)
     MF_ALS.link_db("./animeDB2.sqlite3")
-    MF_ALS.load_samples(10**7)
-    MF_ALS.train()
+    MF_ALS.load_samples(10**5)
+    d = {'username': [70]*8, 'anime_id': [1,2,3,5555,23,54,23,4],"score":[5,8,7,3,9,4,6,7]}
+    df = pd.DataFrame(data=d)
+    print(MF_ALS.ratings.row_cs(70))
+    print(MF_ALS.ratings.ncols)
+    ExplicitMF.update_existing_sparse_ratings(df.to_numpy(),MF_ALS.ratings)
+    #MF_ALS.train()
