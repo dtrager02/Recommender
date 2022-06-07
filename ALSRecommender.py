@@ -186,13 +186,11 @@ class ExplicitMF():
         print(ratings_new.row_vs(ratings_new.nrows-1))
         #print(ratings_new.row(ratings_new.nrows-1).nonzero())
         return ratings_new, ratings
-
+    @numba.njit(cache=True)
     def update_existing_sparse_ratings(user_data,ratings:csr.CSR):
-        # print(self.ratings.colinds)
-        # print(self.ratings.values[77:100])
-        values = np.copy(ratings.values)
-        colinds = np.copy(ratings.colinds)
-        rowptrs = np.copy(ratings.rowptrs)
+        values = np.copy(ratings.values).astype(numba.int64)
+        colinds = np.copy(ratings.colinds).astype(numba.int64)
+        rowptrs = np.copy(ratings.rowptrs).astype(numba.int64)
         for i in range(user_data.shape[0]):
             value = user_data[i,2]
             col_idx = user_data[i,1]
@@ -209,10 +207,6 @@ class ExplicitMF():
         ncols = np.max(colinds)+1
         nnz = colinds.shape[0]
         ratings_new = csr.create(nrows, ncols, nnz, rowptrs, colinds, values)
-        print(ratings_new.row_cs(70))
-        print(ratings_new.row_vs(70))
-        print(ratings_new.row(70).nonzero())
-        print(ratings_new.ncols)
         return ratings_new, ratings
     
     
@@ -227,9 +221,9 @@ if __name__ == "__main__":
     MF_ALS = ExplicitMF(n_factors=80, user_reg=0.05, item_reg=0.05)
     MF_ALS.link_db("./animeDB2.sqlite3")
     MF_ALS.load_samples(10**5)
-    d = {'username': [70]*8, 'anime_id': [1,2,3,5555,23,54,23,4],"score":[5,8,7,3,9,4,6,7]}
+    d = {'username': [70]*10000, 'anime_id': np.random.choice(range(20000),size=10000,replace=False),"score":[5,8,7,3,9,4,6,7,1,1]*1000}
     df = pd.DataFrame(data=d)
-    print(MF_ALS.ratings.row_cs(70))
-    print(MF_ALS.ratings.ncols)
+    start = perf_counter()
     ExplicitMF.update_existing_sparse_ratings(df.to_numpy(),MF_ALS.ratings)
+    print(perf_counter()-start)
     #MF_ALS.train()
