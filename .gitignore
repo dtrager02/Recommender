@@ -1,5 +1,7 @@
 cprofile*
 test*
-
+*.npy
+*.sqlite3
+*.ipynb
 ml-latest/*
 __pycache__/*

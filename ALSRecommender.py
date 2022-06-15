@@ -1,6 +1,17 @@
 #sbatch -N1 -n1 --gpus=1 --mem-per-gpu=8192 --ntasks=1 --cpus-per-task=16  --constraint=g start.sub
 #sacct  --format="JobID,Elapsed,CPUTime,MaxRSS,AveRSS"
 #tail -f slurm-146258.out
+
+"""
+Notes:
+The final model should incorporate a hybrid of MF output and content-user matching
+The proportions of these two metrics is determined by how many items the user has rated
+the content user matching system will include:
+1. Genres of items vs. user genres
+2. release dates of items vs typical "era" of user
+3. popularity of user-rated items (how niche the user is)
+"""
+import sys
 from numpy.linalg import solve
 from sklearn.metrics import mean_squared_error
 import numpy as np
@@ -11,6 +22,7 @@ import sqlite3
 import pandas as pd
 import numba
 import csr 
+import os.path
 class ExplicitMF():
     def __init__(self,  
                  n_factors=40, 
@@ -57,7 +69,7 @@ class ExplicitMF():
         #print(sorted(df[column]))
         return df
     
-    def load_samples(self,n):
+    def load_samples_from_sql(self,n):
         try:
             start = perf_counter()
             self.samples = pd.read_sql(f"select username,anime_id,score from user_records order by username limit {n}",self.con)
@@ -79,14 +91,30 @@ class ExplicitMF():
             # self.ratings = sparse.load_npz("sparse_matrix.npz")
             
             self.ratings = csr.CSR.from_coo(self.samples["username"].to_numpy(), self.samples["anime_id"].to_numpy(),self.samples["score"].to_numpy())
-            #print(self.ratings.rowptrs)
             print(f"Done loading samples from npz file in {perf_counter()-start} s.")
-            #self.test_samples = self.samples.iloc[int(self.samples.shape[0]*.8):,:]
-            #print(f"# of train samples:{self.train_samples.shape[0]}\n# of test samples:{self.test_samples.shape[0]}")
+
         except (Exception) as e:
             print("No database loaded\n")
             print(e.with_traceback())
-    #numba.float32[:,:](numba.float32[:,:],numba.float32[:,:],numba.float32[:,:],numba.float32,numba.typeof('a'))      
+    #numba.float32[:,:](numba.float32[:,:],numba.float32[:,:],numba.float32[:,:],numba.float32,numba.typeof('a')) 
+    
+    def load_samples_from_npy(self,path,n):
+        start = perf_counter()
+        a = np.load(path)
+        a[:,2] *= 2 #adjusts ratings on a 5 pt scale to ints on a 10 pt scale
+        a = a.astype(np.int32) #makes it convertible to CSR
+        if n != "all":
+            a = a[:n] 
+        self.n_users = a[:,0].max() + 1
+        self.n_items = a[:,1].max() + 1
+        drop_indices = np.random.choice(a.shape[0],size=int(a.shape[0]/10),replace=False)
+        self.test_samples = a[drop_indices,:]
+        self.samples = np.delete(a,drop_indices,axis=0)
+
+        print(f"# of train samples: {self.samples.shape[0]}, # of test samples: {self.test_samples.shape[0]}")
+        self.ratings = csr.CSR.from_coo(self.samples[:,0], self.samples[:,1],self.samples[:,2])
+        print(f"Done loading samples from npz file in {perf_counter()-start} s.")
+        
     @numba.njit(cache=True,parallel=True,fastmath=True)
     def als_step(
                  latent_vectors,
@@ -154,10 +182,10 @@ class ExplicitMF():
                                            self.item_reg, 
                                            type='item')
             ctr += 1
-            if ctr % 2:
-                print("Iteration: %d ; train error = %.4f" % (ctr, ExplicitMF.mse(self.samples.to_numpy(),self.user_vecs,self.item_vecs)))
+            if ctr % 5:
+                print("Iteration: %d ; train error = %.4f" % (ctr, ExplicitMF.mse(self.samples,self.user_vecs,self.item_vecs)))
                 print("Threading layer chosen: %s" % numba.threading_layer())
-        print("Test error = %.4f" % (ExplicitMF.mse(self.test_samples.to_numpy(),self.user_vecs,self.item_vecs)))
+        print("Test error = %.4f" % (ExplicitMF.mse(self.test_samples,self.user_vecs,self.item_vecs)))
     @numba.njit(cache=True,parallel=True,fastmath=True)
     def mse(samples,user_vecs,item_vecs): # samples format : user,item,rating
         test_errors = np.zeros(samples.shape[0])
@@ -188,9 +216,9 @@ class ExplicitMF():
         return ratings_new, ratings
     @numba.njit(cache=True)
     def update_existing_sparse_ratings(user_data,ratings:csr.CSR):
-        values = np.copy(ratings.values).astype(numba.int64)
-        colinds = np.copy(ratings.colinds).astype(numba.int64)
-        rowptrs = np.copy(ratings.rowptrs).astype(numba.int64)
+        values = ratings.values.astype(numba.int64)
+        colinds = ratings.colinds.astype(numba.int64)
+        rowptrs = ratings.rowptrs
         for i in range(user_data.shape[0]):
             value = user_data[i,2]
             col_idx = user_data[i,1]
@@ -209,6 +237,16 @@ class ExplicitMF():
         ratings_new = csr.create(nrows, ncols, nnz, rowptrs, colinds, values)
         return ratings_new, ratings
     
+    def save_factor(self,factor,base_name):
+        path = os.path.join("/factors",f"{base_name},n_factors={self.n_factors},item_reg={self.item_reg},user_reg={self.user_reg}",".npy")
+        np.save(path,factor)
+        
+    def save_all_factors(self):
+        try:
+            self.save_factor(self.user_vecs,"user_factor_movielense")
+            self.save_factor(self.item_vecs,"user_factor_movielense")
+        except:
+            print("Factors were not initialized")
     
     def predict(self, u, i):
         """ Single user and item prediction. """
@@ -218,12 +256,14 @@ class ExplicitMF():
 if __name__ == "__main__":
     numba.warnings.simplefilter('ignore', category=numba.errors.NumbaDeprecationWarning)
     numba.warnings.simplefilter('ignore', category=numba.errors.NumbaPendingDeprecationWarning)
-    MF_ALS = ExplicitMF(n_factors=80, user_reg=0.05, item_reg=0.05)
-    MF_ALS.link_db("./animeDB2.sqlite3")
-    MF_ALS.load_samples(10**5)
-    d = {'username': [70]*10000, 'anime_id': np.random.choice(range(20000),size=10000,replace=False),"score":[5,8,7,3,9,4,6,7,1,1]*1000}
-    df = pd.DataFrame(data=d)
-    start = perf_counter()
-    ExplicitMF.update_existing_sparse_ratings(df.to_numpy(),MF_ALS.ratings)
-    print(perf_counter()-start)
-    #MF_ALS.train()
+    if len(sys.argv) == 4:
+        n_factors = int(sys.argv[1])
+        item_reg = float(sys.argv[2])
+        user_reg = float(sys.argv[3])
+        MF_ALS = ExplicitMF(n_factors=n_factors, user_reg=user_reg, item_reg=item_reg)
+    else:
+        MF_ALS = ExplicitMF(n_factors=4, user_reg=.05, item_reg=.05)
+    print(f"Using hyperparams: n_factors={MF_ALS.n_factors},item_reg={MF_ALS.item_reg},user_reg={MF_ALS.user_reg}")
+    
+    MF_ALS.load_samples_from_npy("./movielense_27.npy","all")
+    MF_ALS.train()
