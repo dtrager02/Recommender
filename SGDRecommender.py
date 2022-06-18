@@ -145,7 +145,7 @@ class ExplicitMF():
         print("Test error = %.4f" % (ExplicitMF.mse(self.test_samples,self.P,self.Q,self.b_u,self.b_i,self.b)))
 
     # Stochastic gradient descent to get optimized P and Q matrix
-    @numba.njit(cache=True,fastmath=True,parallel=True)
+    @numba.njit(cache=True,fastmath=True)
     def sgd(P,Q,b_u,b_i,b,y,
             samples,ratings:csr.CSR,
             alpha,beta1,beta2):
@@ -181,25 +181,54 @@ class ExplicitMF():
     def predict(row,col,user_vecs,item_vecs):
         return user_vecs[row, :].dot(item_vecs[col,:].T)
     
-    def make_independent_chunks(self):
+    def get_chunk_breakpoints(self):
         chunk_size = numba.config.NUMBA_DEFAULT_NUM_THREADS
-        breakpoint = int(self.ratings.nnz/(chunk_size))+chunk_size
-        row_ranges,col_ranges = [],[]
+        breakpoint = int(self.ratings.nnz/(chunk_size+1))+chunk_size
+        self.row_ranges,self.col_ranges = [],[]
         offset = 0
         previous_index = 0
         for i in range(len(self.ratings.rowptrs)):
             if self.ratings.rowptrs[i] -offset > breakpoint:
-                row_ranges.append((previous_index,i))
+                self.row_ranges.append((previous_index,i))
                 previous_index = i
                 offset+=breakpoint
-        row_ranges.append((previous_index,len(self.ratings.rowptrs)))
-        col_breakpoints = list(range(0,self.n_items,int(self.n_items/chunk_size)))
+        self.row_ranges.append((previous_index,len(self.ratings.rowptrs)))
+        col_breakpoints = list(range(0,self.n_items,int(self.n_items/(chunk_size+1))+chunk_size))
         for i in range(len(col_breakpoints)-1):
-            col_ranges.append((col_breakpoints[i],col_breakpoints[i+1]))
-        col_ranges.append((col_breakpoints[-1],col_breakpoints[-1]+int(self.n_items/chunk_size)))   
-        return row_ranges,col_ranges
-                
+            self.col_ranges.append((col_breakpoints[i],col_breakpoints[i+1]))
+        self.col_ranges.append((col_breakpoints[-1],col_breakpoints[-1]+int(self.n_items/chunk_size)))
+        print(len(self.row_ranges),len(self.col_ranges))
+        return self.row_ranges,self.col_ranges
     
+    def generate_indpendent_samples(self):
+        self.get_chunk_breakpoints()
+        self.random_renumber_samples()
+        all_groups = []
+        for i in range(len(self.row_ranges)):
+            row_groups = []
+            for j in range(len(self.col_ranges)):
+                row_condition = np.logical_and(self.row_ranges[i][1]> self.samples[:,0], self.samples[:,0]>= self.row_ranges[i][0])
+                col_condition = np.logical_and(self.col_ranges[j][1]> self.samples[:,1], self.samples[:,1] >= self.col_ranges[j][0])
+                group_values = self.samples[np.logical_and(row_condition,col_condition)]
+                row_groups.append(group_values)
+            all_groups.append(row_groups)
+        total = 0
+        for i in all_groups:
+            for s in i:
+                print(s.shape)
+        return all_groups
+    
+    def random_renumber_samples(self):
+        col_index = np.arange(self.n_items)
+        row_index = np.arange(self.n_users)
+        np.random.shuffle(col_index)
+        np.random.shuffle(row_index)
+        
+        self.col_converter = dict(zip([*range(self.n_items)],col_index))
+        self.row_converter = dict(zip([*range(self.n_users)],row_index))
+        
+        self.samples[:,0] = pd.Series(self.samples[:,0]).map(self.row_converter).to_numpy()
+        self.samples[:,1] = pd.Series(self.samples[:,1]).map(self.col_converter).to_numpy()
     @numba.njit(cache=True)
     def add_users_to_sparse(user_data,ratings:csr.CSR):
         # print(self.ratings.colinds)
@@ -243,19 +272,15 @@ class ExplicitMF():
         return ratings_new, ratings
     
     def save_factor(self,factor,base_name):
-        path = os.path.join("/factors",f"{base_name},n_factors={self.n_factors},item_reg={self.item_reg},user_reg={self.user_reg}",".npy")
+        path = os.path.join("/factors",f"{base_name},n_factors={self.n_factors},item_reg={self.beta1},user_reg={self.beta2}",".npy")
         np.save(path,factor)
         
     def save_all_factors(self):
         try:
-            self.save_factor(self.user_vecs,"user_factor_movielense")
-            self.save_factor(self.item_vecs,"user_factor_movielense")
+            self.save_factor(self.P,"user_factor_movielense")
+            self.save_factor(self.Q,"item_factor_movielense")
         except:
             print("Factors were not initialized")
-    
-    def predict(self, u, i):
-        """ Single user and item prediction. """
-        return self.user_vecs[u, :].dot(self.item_vecs[i, :].T)
     
 
 if __name__ == "__main__":
@@ -272,4 +297,6 @@ if __name__ == "__main__":
     
     MF_ALS.load_samples_from_npy("./movielense_27.npy",100000)
     #MF_ALS.train(80)
-    print(MF_ALS.make_independent_chunks())
+    MF_ALS.generate_indpendent_samples()
+    print("\n\n\n")
+    MF_ALS.generate_indpendent_samples()
