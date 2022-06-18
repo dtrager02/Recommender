@@ -26,9 +26,9 @@ import os.path
 class ExplicitMF():
     def __init__(self,  
                  n_factors=40, 
-                 item_reg=0.0, 
-                 user_reg=0.0,
-                 verbose=False):
+                 alpha=0.005, 
+                 beta1=.05,
+                 beta2=.015):
         """
         Train a matrix factorization model to predict empty 
         entries in a matrix. The terminology assumes a 
@@ -54,9 +54,9 @@ class ExplicitMF():
         """
         
         self.n_factors = n_factors
-        self.item_reg = item_reg
-        self.user_reg = user_reg
-        self._v = verbose
+        self.alpha = alpha
+        self.beta1 = beta1
+        self.beta2 = beta2
     def link_db(self,path):
         self.con = sqlite3.connect(path)
         
@@ -116,89 +116,90 @@ class ExplicitMF():
         print(f"Done loading samples from npz file in {perf_counter()-start} s.")
         
     #@numba.njit(cache=True,parallel=True,fastmath=True)
-    def als_step(
-                 latent_vectors,
-                 fixed_vecs,
-                 ratings : csr.CSR,
-                 _lambda,
-                 type):
-        """
-        One of the two ALS steps. Solve for the latent vectors
-        specified by type.
-        """
-        temp_fixed_vecs = fixed_vecs.copy()
-        lambdaI = np.eye(temp_fixed_vecs.shape[1]) * _lambda
-        if type == 'user':
-            # Precompute
-            for u in numba.prange(latent_vectors.shape[0]):
-                nonzero_items = ratings.row_cs(u)
-                fv = temp_fixed_vecs[nonzero_items,:]
-
-                YTY = (fv.T).dot(fv)
-                A = YTY + lambdaI*(fv.shape[0]+1)
-                b = ratings.row(u)[nonzero_items].dot(fv)
-
-                latent_vectors[u, :] = solve(A, b)
-        elif type == 'item':
-            ratings_T = ratings.transpose()
-            for i in numba.prange(latent_vectors.shape[0]):
-                nonzero_items = ratings_T.row_cs(i)
-                #print(ratings[0,:].toarray().reshape((-1,)).shape,fixed_vecs.shape,ratings.shape)
-                #nonzero_items = np.nonzero(ratings[:,i].toarray().reshape((-1,)))[0]
-                fv = temp_fixed_vecs[nonzero_items,:]
-                #print(nonzero_items.shape,temp_fixed_vecs.shape)
-                XTX = (fv.T).dot(fv)
-                A = XTX + lambdaI*(fv.shape[0]+1)
-                b = ratings_T.row(i)[nonzero_items].dot(fv) #(1xm)(mxd)
-                #print(ratings_T[i,nonzero_items[row_index]].shape,b.shape)
-                latent_vectors[i, :] = solve(A,b)
-        return latent_vectors
-
-    def train(self, n_iter=30):
-        """ Train model for n_iter iterations from scratch."""
-        # initialize latent vectors
-        self.user_vecs = np.random.random((self.n_users, self.n_factors)).astype("float64")
-        self.item_vecs = np.random.random((self.n_items, self.n_factors)).astype("float64")
-        self.user_biases = np.random.normal(size=self.n_users).astype("float64")
-        self.item_biases = np.random.normal(size=self.n_items).astype("float64")
+    # Initializing user-feature and movie-feature matrix 
+    def train(self,iters):
+        self.P = np.random.normal(scale=1./self.n_factors, size=(self.n_users, self.n_factors)) #users
+        self.Q = np.random.normal(scale=1./self.n_factors, size=(self.n_items, self.n_factors)) # items
+        self.y = np.random.normal(scale=1./self.n_factors, size=(self.n_items, self.n_factors)) # implicit items
+        # Initializing the bias terms
+        self.b_u = np.zeros(self.n_users)
+        self.b_i = np.zeros(self.n_items)
+        self.b = np.mean(self.samples[:,2])
         
-        self.partial_train(n_iter)
-    
-    def partial_train(self, n_iter):
-        """ 
-        Train model for n_iter iterations. Can be 
-        called multiple times for further training.
-        """
-        ctr = 1
-        while ctr <= n_iter:
-            # if ctr % 10 == 0 and self._v:
-            #     print(f'\tcurrent iteration: {ctr}')
-            self.user_vecs = ExplicitMF.als_step(self.user_vecs, 
-                                           self.item_vecs, 
-                                           self.ratings, 
-                                           self.user_reg, 
-                                           type='user')
-            if ctr % 5 == 0:
-                print("Iteration: %d ; train error after user update= %.4f" % (ctr, ExplicitMF.mse(self.samples,self.user_vecs,self.item_vecs)))
-            self.item_vecs = ExplicitMF.als_step(self.item_vecs, 
-                                           self.user_vecs, 
-                                           self.ratings, 
-                                           self.item_reg, 
-                                           type='item')
-            if ctr % 5 == 0:
-                print("Iteration: %d ; train error after item updates= %.4f" % (ctr, ExplicitMF.mse(self.samples,self.user_vecs,self.item_vecs)))
-            ctr += 1
+
+        # Stochastic gradient descent for given number of iterations
+        previous_mse = 0
+        for i in range(iters):
+            np.random.shuffle(self.samples)
+            self.P,self.Q,self.y,self.b_u,self.b_i = ExplicitMF.sgd(self.P,self.Q,self.b_u,self.b_i,self.b,self.y,self.samples,self.ratings,self.alpha,self.beta1,self.beta2)
             
-        print("Test error = %.4f" % (ExplicitMF.mse(self.test_samples,self.user_vecs,self.item_vecs)))
+            if i % 2:
+                train_mse = ExplicitMF.mse(self.samples,self.P,self.Q,self.b_u,self.b_i,self.b)
+                if train_mse > previous_mse and previous_mse:
+                    self.alpha*=.5
+                else:
+                    self.alpha*=1.05
+                print(f"Changed alpha to {self.alpha}")
+                previous_mse = train_mse - .0001
+                print("Iteration: %d ; train error = %.4f" % (i,train_mse))
+        print("Test error = %.4f" % (ExplicitMF.mse(self.test_samples,self.P,self.Q,self.b_u,self.b_i,self.b)))
+
+    # Stochastic gradient descent to get optimized P and Q matrix
+    @numba.njit(cache=True,fastmath=True,parallel=True)
+    def sgd(P,Q,b_u,b_i,b,y,
+            samples,ratings:csr.CSR,
+            alpha,beta1,beta2):
+        for i in range(samples.shape[0]):
+            user = samples[i,0]
+            item = samples[i,1]
+            rated_items = ratings.row_cs(user)
+            R_u = np.sqrt(rated_items.shape[0])
+            y_sum = np.sum(y[rated_items,:],axis=0)
+            prediction = Q[item,:].dot((P[user, :]+y_sum/R_u).T) + b_u[user] + b_i[item] + b
+            e = (samples[i,2]-prediction)
+            
+            b_u[user] += alpha * (e - beta1 * b_u[user])
+            b_i[item] += alpha * (e - beta1 * b_i[item])
+            
+            P[user, :] +=alpha * (e *Q[item, :] - beta2 * P[user,:])
+            Q[item, :] +=alpha * (e *P[user, :] - beta2 * Q[item,:])
+  
+            y[rated_items,:] += alpha*(e/R_u*Q[rated_items,:]-beta2*y[rated_items,:])
+            
+        return P,Q,y,b_u,b_i
+
     @numba.njit(cache=True,parallel=True,fastmath=True)
-    def mse(samples,user_vecs,item_vecs): # samples format : user,item,rating
+    def mse(samples,P,Q,b_u,b_i,b): # samples format : user,item,rating
         test_errors = np.zeros(samples.shape[0])
         for i in numba.prange(samples.shape[0]):
             user = samples[i][0]
             item = samples[i][1]
-            prediction = user_vecs[user, :].dot(item_vecs[item, :].T)
+            prediction = prediction = P[user, :].dot(Q[item,:].T) + b_u[user] + b_i[item] + b
             test_errors[i] = samples[i][2] - prediction
         return np.sqrt(np.sum(np.square(test_errors))/test_errors.shape[0])
+    
+    def predict(row,col,user_vecs,item_vecs):
+        return user_vecs[row, :].dot(item_vecs[col,:].T)
+    
+    def make_independent_chunks(self):
+        chunk_size = numba.config.NUMBA_DEFAULT_NUM_THREADS
+        breakpoint = int(self.ratings.nnz/(chunk_size))+chunk_size
+        row_ranges,col_ranges = [],[]
+        offset = 0
+        previous_index = 0
+        for i in range(len(self.ratings.rowptrs)):
+            if self.ratings.rowptrs[i] -offset > breakpoint:
+                row_ranges.append((previous_index,i))
+                previous_index = i
+                offset+=breakpoint
+        row_ranges.append((previous_index,len(self.ratings.rowptrs)))
+        col_breakpoints = list(range(0,self.n_items,int(self.n_items/chunk_size)))
+        for i in range(len(col_breakpoints)-1):
+            col_ranges.append((col_breakpoints[i],col_breakpoints[i+1]))
+        col_ranges.append((col_breakpoints[-1],col_breakpoints[-1]+int(self.n_items/chunk_size)))   
+        return row_ranges,col_ranges
+                
+    
     @numba.njit(cache=True)
     def add_users_to_sparse(user_data,ratings:csr.CSR):
         # print(self.ratings.colinds)
@@ -266,8 +267,9 @@ if __name__ == "__main__":
         user_reg = float(sys.argv[3])
         MF_ALS = ExplicitMF(n_factors=n_factors, user_reg=user_reg, item_reg=item_reg)
     else:
-        MF_ALS = ExplicitMF(n_factors=4, user_reg=.05, item_reg=.05)
-    print(f"Using hyperparams: n_factors={MF_ALS.n_factors},item_reg={MF_ALS.item_reg},user_reg={MF_ALS.user_reg}")
+        MF_ALS = ExplicitMF(n_factors=30)
+    print(f"Using hyperparams: n_factors={MF_ALS.n_factors},alpha={MF_ALS.alpha},beta1={MF_ALS.beta1},beta2={MF_ALS.beta2}")
     
-    MF_ALS.load_samples_from_npy("./movielense_27.npy",50000)
-    MF_ALS.train()
+    MF_ALS.load_samples_from_npy("./movielense_27.npy",100000)
+    #MF_ALS.train(80)
+    print(MF_ALS.make_independent_chunks())
