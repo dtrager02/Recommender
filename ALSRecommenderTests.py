@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from ALSRecommender import *
+from numba import config
 from time import perf_counter
 """
     Test for updating the sparse matrix using update_existing_sparse_ratings()
@@ -22,31 +23,16 @@ a= np.arange(100).reshape(5,20)
 # print(np.sum(a,axis=0))
 # print(numba.config.NUMBA_DEFAULT_NUM_THREADS)
 # print(list(range(1,100,35)))
-k = 500000
-
-start = perf_counter()
-a = np.empty(k)
-for i in range(k):
-    a[i]  = np.log(i+1)
-end = perf_counter()
-print(end-start)
-
-start = perf_counter()
-b = []
-for i in range(k):
-    b.append(np.log(i+1))
-end = perf_counter()
-print(end-start)
-
-start = perf_counter()
-c = [0]*k
-for i in range(k):
-    c[i]  = np.log(i+1)
-end = perf_counter()
-print(end-start)
-
-start = perf_counter()
-c = np.random.random(size=k)
-c = np.log(c+1) 
-end = perf_counter()
-print(end-start)
+config.THREADING_LAYER = 'default'
+@numba.njit(parallel=True)
+def func():
+    b = np.zeros((100,100000))
+    a = np.ones((100,100000))
+    sum = 0
+    for i in numba.prange(100):
+        for j in range(100000):
+            sum+= a[i,j]
+            b[i,j] = a[i,j]
+    return sum, np.sum(b), 1
+print(func())
+print(numba.threading_layer())

@@ -126,11 +126,13 @@ class ExplicitMF():
         self.b_i = np.zeros(self.n_items)
         self.b = np.mean(self.samples[:,2])
         
-
+        all_groups = self.generate_indpendent_samples()
+        
         # Stochastic gradient descent for given number of iterations
         previous_mse = 0
         for i in range(iters):
-            np.random.shuffle(self.samples)
+            #np.random.shuffle(self.samples)
+            
             self.P,self.Q,self.y,self.b_u,self.b_i = ExplicitMF.sgd(self.P,self.Q,self.b_u,self.b_i,self.b,self.y,self.samples,self.ratings,self.alpha,self.beta1,self.beta2)
             
             if i % 2:
@@ -180,6 +182,10 @@ class ExplicitMF():
     
     def predict(row,col,user_vecs,item_vecs):
         return user_vecs[row, :].dot(item_vecs[col,:].T)
+    
+    def generate_chunk_order(self,iters):
+        all_groups = self.generate_indpendent_samples()
+        
     
     def get_chunk_breakpoints(self):
         chunk_size = numba.config.NUMBA_DEFAULT_NUM_THREADS
