@@ -115,7 +115,7 @@ class ExplicitMF():
         self.ratings = csr.CSR.from_coo(self.samples[:,0], self.samples[:,1],self.samples[:,2])
         print(f"Done loading samples from npz file in {perf_counter()-start} s.")
         
-    #@numba.njit(cache=True,parallel=True,fastmath=True)
+    @numba.njit(cache=True,parallel=True,fastmath=True)
     def als_step(
                  latent_vectors,
                  fixed_vecs,
