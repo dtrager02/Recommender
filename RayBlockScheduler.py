@@ -3,21 +3,37 @@ import queue
 import time
 import os
 import random
+import asyncio
+import ray
+import numba
+import numpy as np
+import csr
 from multiprocessing import Process, Queue, Lock, Manager
 from collections import defaultdict
 
 from SGDRecommender import ExplicitMF
 
+"""
+Struct that will be serialized and sent to workers for processing
+"""
 class SubSample:
-    def __init__(self,block_pos:tuple,samples) -> None:
-        self.block_pos = block_pos
-        self.samples = samples
+    def __init__(self,block_pos:tuple,P,Q,b_u,b_i,b,y,
+                alpha,beta1,beta2) -> None:
+        self.block_pos = block_pos #used to get numpy array of samples in shared samples grid
+        self.P = P #this is a subset of P belonging to the users of the block
+        self.Q = Q
+        self.b_u=b_u
+        self.b_i=b_i
+        self.b=b
+        self.y=y
+        self.alpha=alpha
+        self.beta1=beta1
+        self.beta2=beta2
         
-
+@ray.remote
 class BlockScheduler:
-    def __init__(self,grid,iters) -> None:
-        self.grid = grid
-        self.width = len(grid)
+    def __init__(self,width,iters) -> None:
+        self.width = width
         self.n_threads = self.width -1
         temp = [0]*self.width
         self.update_counter = []
@@ -26,7 +42,7 @@ class BlockScheduler:
         self.unused_rows,self.unused_cols=[*range(self.width)],[*range(self.width)]
         self.completed_rows,self.completed_cols=set(),set()
         self.iters  = iters
-        print(self.update_counter)
+        self.test = 0
     
     def check_completion(self):
         #print(self.unused_rows,self.unused_cols)
@@ -36,9 +52,8 @@ class BlockScheduler:
             return False
     
     def get_next(self,completed=None):
-        print("Unused rows",self.unused_rows,"Unused cols: ",self.unused_cols)
-        print('\n'.join([''.join(['{:4}'.format(item) for item in row]) 
-      for row in self.update_counter]))
+        # print("Unused rows",self.unused_rows,"Unused cols: ",self.unused_cols)
+        # print('\n'.join([''.join(['{:4}'.format(item) for item in row]) 
         if completed:
             self.completed_chunk(completed)
         # if len(self.unused_cols) != len(self.unused_rows):
@@ -53,7 +68,7 @@ class BlockScheduler:
                     min = self.update_counter[i][j]
                     min_idx = (i,j)
         if min_idx != (-1,-1):
-            output = SubSample(min_idx,self.grid[min_idx[0]][min_idx[1]])
+            output = min_idx
             row_idx = self.unused_rows.index(min_idx[0])
             col_idx = self.unused_cols.index(min_idx[1])
             self.unused_cols.pop(col_idx)
@@ -63,6 +78,7 @@ class BlockScheduler:
         return output
             
     def completed_chunk(self,idx):
+        self.test += 1
         row = idx[0]
         col = idx[1]
         if idx[0] in self.unused_rows or idx[1] in self.unused_cols:
@@ -88,71 +104,40 @@ class BlockScheduler:
         else:
             self.unused_rows.append(row)
             
- 
- 
-# The consumer function takes data off of the Queue
-def consumer(in_queue,out_queue, lock,model:ExplicitMF):
-    # Synchronize access to the console
-    with lock:
-        print('Starting consumer => {}'.format(os.getpid()))
-     
-    # Run indefinitely
-    while True:    
-        # If the queue is empty, queue.get() will block until the queue has data
-        block = in_queue.get()  
-        # Synchronize access to the console
-        # with lock:
-        #     print('{} got {}'.format(os.getpid(), block.block_pos))
-        if block == "000":
-            return 0
-        elif block:
-           # time.sleep(random.randint(1,4)/1000.0)
-            with lock:
-                model.expirimental_setter(block.block_pos[0],block.block_pos[1])
-            out_queue.put(block.block_pos)
-        else:
-            continue
- 
-# if __name__ == '__main__':
-     
-#     # Some lists with our favorite characters
- 
-#     # Create the Queue object
-#     m = multiprocessing.Manager()
-#     in_queue = m.Queue()
-#     out_queue = m.Queue()
-#     scheduler = BlockScheduler(multiprocessing.cpu_count()+2,6)
-#     # Create a lock object to synchronize resource access
-#     lock = Lock()
- 
-#     consumers = []
- 
-#     # Create consumer processes
-#     for i in range(multiprocessing.cpu_count()):
-#         p = Process(target=consumer, args=(in_queue,out_queue, lock))
-#         consumers.append(p)
-#         in_queue.put(scheduler.get_next())
- 
-#     for c in consumers:
-#         c.start()
+    def get_update_counter(self):
+        return self.update_counter
     
-#     #scheduler will handle putting and retreiving items from queues
-#     done = False
-#     while not done:
-#         updated_block = out_queue.get(timeout=20)
-#         next = scheduler.get_next(completed=updated_block)
-#         done = scheduler.check_completion()
-#         if done:
-#             print("Done!")
-#             for i in range(multiprocessing.cpu_count()):
-#                 in_queue.put("000")
-#             break
-#         in_queue.put(next)
+    def get_test(self):
+        return self.test
+    
+    def __self__(self):
+        return self
+    
 
-    
-#     # Like threading, we have a join() method that synchronizes our program
-#     for c in consumers:
-#         c.join()
+# The consumer function takes data off of the Queue
+@ray.remote
+def consumer(scheduler : BlockScheduler):
+    block = ray.get(scheduler.get_next.remote())
+    while True:
+        start = time.perf_counter()
+        time.sleep(1)
+        print(time.perf_counter()-start)
+        if block is None:
+            return 1
+        time.sleep(random.random()/500.0)
+        block = ray.get(scheduler.get_next.remote(completed=(block[0],block[1])))
  
-#     print('Parent process exiting...')
     
+
+scheduler = BlockScheduler.remote(multiprocessing.cpu_count()+1,3)
+# #scheduler will handle putting and retreiving items from queues
+trainer = ExplicitMF(n_factors=40)
+trainer.load_samples_from_npy("./movielense_27.npy",100000)
+ratings = ray.put(trainer.ratings)
+print(ray.get(ratings).row_cs(5))
+blocks = ExplicitMF(n_factors=40)
+results= ray.get([consumer.remote(scheduler) for _ in range(multiprocessing.cpu_count())])
+print("results",results)
+counter = ray.get(scheduler.get_update_counter.remote())
+print(counter)
+

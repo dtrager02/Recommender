@@ -57,6 +57,7 @@ class ExplicitMF():
         self.alpha = alpha
         self.beta1 = beta1
         self.beta2 = beta2
+        self.test_grid = np.zeros((9,9))
     def link_db(self,path):
         self.con = sqlite3.connect(path)
         
@@ -115,7 +116,7 @@ class ExplicitMF():
         self.ratings = csr.CSR.from_coo(self.samples[:,0], self.samples[:,1],self.samples[:,2])
         print(f"Done loading samples from npz file in {perf_counter()-start} s.")
         
-    #@numba.njit(cache=True,parallel=True,fastmath=True)
+    #@numba.njit(cache=True,,fastmath=True)
     # Initializing user-feature and movie-feature matrix 
     def train(self,iters):
         self.P = np.random.normal(scale=1./self.n_factors, size=(self.n_users, self.n_factors)) #users
@@ -126,15 +127,15 @@ class ExplicitMF():
         self.b_i = np.zeros(self.n_items)
         self.b = np.mean(self.samples[:,2])
         
-        all_groups = self.generate_indpendent_samples()
+        #all_groups = self.generate_indpendent_samples()
         
         # Stochastic gradient descent for given number of iterations
         previous_mse = 0
         for i in range(iters):
             #np.random.shuffle(self.samples)
-            
+            sgd_time = perf_counter()
             self.P,self.Q,self.y,self.b_u,self.b_i = ExplicitMF.sgd(self.P,self.Q,self.b_u,self.b_i,self.b,self.y,self.samples,self.ratings,self.alpha,self.beta1,self.beta2)
-            
+            print(f"SGD time: {perf_counter()-sgd_time}")
             if i % 2:
                 train_mse = ExplicitMF.mse(self.samples,self.P,self.Q,self.b_u,self.b_i,self.b)
                 if train_mse > previous_mse and previous_mse:
@@ -147,7 +148,7 @@ class ExplicitMF():
         print("Test error = %.4f" % (ExplicitMF.mse(self.test_samples,self.P,self.Q,self.b_u,self.b_i,self.b)))
 
     # Stochastic gradient descent to get optimized P and Q matrix
-    @numba.njit(cache=True,fastmath=True)
+    #@numba.njit(cache=True,fastmath=True)
     def sgd(P,Q,b_u,b_i,b,y,
             samples,ratings:csr.CSR,
             alpha,beta1,beta2):
@@ -181,15 +182,12 @@ class ExplicitMF():
         return np.sqrt(np.sum(np.square(test_errors))/test_errors.shape[0])
     
     def predict(row,col,user_vecs,item_vecs):
-        return user_vecs[row, :].dot(item_vecs[col,:].T)
-    
-    def generate_chunk_order(self,iters):
-        all_groups = self.generate_indpendent_samples()
-        
+        return user_vecs[row, :].dot(item_vecs[col,:].T) 
     
     def get_chunk_breakpoints(self):
+        # this is imprecise but works for at least 32 threads
         chunk_size = numba.config.NUMBA_DEFAULT_NUM_THREADS
-        breakpoint = int(self.ratings.nnz/(chunk_size+1))+chunk_size
+        breakpoint = int(self.ratings.nnz/(chunk_size+1))+chunk_size 
         self.row_ranges,self.col_ranges = [],[]
         offset = 0
         previous_index = 0
@@ -203,7 +201,7 @@ class ExplicitMF():
         for i in range(len(col_breakpoints)-1):
             self.col_ranges.append((col_breakpoints[i],col_breakpoints[i+1]))
         self.col_ranges.append((col_breakpoints[-1],col_breakpoints[-1]+int(self.n_items/chunk_size)))
-        print(len(self.row_ranges),len(self.col_ranges))
+        print("Shape of FPSGD grid:",len(self.row_ranges),len(self.col_ranges))
         return self.row_ranges,self.col_ranges
     
     def generate_indpendent_samples(self):
@@ -218,10 +216,10 @@ class ExplicitMF():
                 group_values = self.samples[np.logical_and(row_condition,col_condition)]
                 row_groups.append(group_values)
             all_groups.append(row_groups)
-        total = 0
+
+        print("FPSG Grid Sample Shapes:")
         for i in all_groups:
-            for s in i:
-                print(s.shape)
+            print([s.shape for s in i])
         return all_groups
     
     def random_renumber_samples(self):
@@ -232,6 +230,13 @@ class ExplicitMF():
         
         self.col_converter = dict(zip([*range(self.n_items)],col_index))
         self.row_converter = dict(zip([*range(self.n_users)],row_index))
+        
+        self.samples[:,0] = pd.Series(self.samples[:,0]).map(self.row_converter).to_numpy()
+        self.samples[:,1] = pd.Series(self.samples[:,1]).map(self.col_converter).to_numpy()
+        
+    def unrandomize_samples(self):
+        self.col_converter = dict(zip(self.col_converter.values(),self.col_converter.keys()))
+        self.row_converter =  dict(zip(self.row_converter.values(),self.row_converter.keys()))
         
         self.samples[:,0] = pd.Series(self.samples[:,0]).map(self.row_converter).to_numpy()
         self.samples[:,1] = pd.Series(self.samples[:,1]).map(self.col_converter).to_numpy()
@@ -287,22 +292,22 @@ class ExplicitMF():
             self.save_factor(self.Q,"item_factor_movielense")
         except:
             print("Factors were not initialized")
-    
+    def expirimental_setter(self,x,y):
+        self.test_grid[x,y] += 1
+        
 
 if __name__ == "__main__":
-    numba.warnings.simplefilter('ignore', category=numba.errors.NumbaDeprecationWarning)
-    numba.warnings.simplefilter('ignore', category=numba.errors.NumbaPendingDeprecationWarning)
+
     if len(sys.argv) == 4:
         n_factors = int(sys.argv[1])
-        item_reg = float(sys.argv[2])
-        user_reg = float(sys.argv[3])
-        MF_ALS = ExplicitMF(n_factors=n_factors, user_reg=user_reg, item_reg=item_reg)
+        alpha = float(sys.argv[2])
+        beta1 = float(sys.argv[3])
+        beta2 = float(sys.argv[4])
+        MF_ALS = ExplicitMF(n_factors=n_factors, alpha=alpha, beta1=beta1, beta2=beta2)
     else:
         MF_ALS = ExplicitMF(n_factors=30)
     print(f"Using hyperparams: n_factors={MF_ALS.n_factors},alpha={MF_ALS.alpha},beta1={MF_ALS.beta1},beta2={MF_ALS.beta2}")
     
     MF_ALS.load_samples_from_npy("./movielense_27.npy",100000)
-    #MF_ALS.train(80)
-    MF_ALS.generate_indpendent_samples()
-    print("\n\n\n")
-    MF_ALS.generate_indpendent_samples()
+    MF_ALS.train(80)
+    #grid = MF_ALS.generate_indpendent_samples()
