@@ -32,8 +32,9 @@ class SubSample:
         
 @ray.remote
 class BlockScheduler:
-    def __init__(self,width,iters) -> None:
+    def __init__(self,trainer:ExplicitMF,width,iters) -> None:
         self.width = width
+        self.trainer = trainer
         self.n_threads = self.width -1
         temp = [0]*self.width
         self.update_counter = []
@@ -104,6 +105,37 @@ class BlockScheduler:
         else:
             self.unused_rows.append(row)
             
+    def make_subsample(self,block_pos):
+        row_range = self.trainer.row_ranges[block_pos[0]]
+        col_range = self.trainer.col_ranges[block_pos[1]]
+        subsample = SubSample(block_pos,
+                              trainer.P[row_range[0]:row_range[1]],
+                              trainer.Q[col_range[0]:col_range[1]],
+                              trainer.b_u[row_range[0]:row_range[1]],
+                              trainer.b_i[col_range[0]:col_range[1]],
+                              trainer.b,
+                              trainer.y[col_range[0]:col_range[1]],
+                              trainer.alpha,
+                              trainer.beta1,
+                              trainer.beta2)  
+        return subsample
+    
+    def update_trainer(self,subsample):
+        row_range = self.trainer.row_ranges[block_pos[0]]
+        col_range = self.trainer.col_ranges[block_pos[1]]
+        subsample = SubSample(block_pos,
+                              trainer.P[row_range[0]:row_range[1]],
+                              trainer.Q[col_range[0]:col_range[1]],
+                              trainer.b_u[row_range[0]:row_range[1]],
+                              trainer.b_i[col_range[0]:col_range[1]],
+                              trainer.b,
+                              trainer.y[col_range[0]:col_range[1]],
+                              trainer.alpha,
+                              trainer.beta1,
+                              trainer.beta2)  
+        return subsample
+                            
+        
     def get_update_counter(self):
         return self.update_counter
     
@@ -112,6 +144,7 @@ class BlockScheduler:
     
     def __self__(self):
         return self
+    
     
 
 # The consumer function takes data off of the Queue
@@ -133,9 +166,8 @@ scheduler = BlockScheduler.remote(multiprocessing.cpu_count()+1,3)
 # #scheduler will handle putting and retreiving items from queues
 trainer = ExplicitMF(n_factors=40)
 trainer.load_samples_from_npy("./movielense_27.npy",100000)
-ratings = ray.put(trainer.ratings)
-print(ray.get(ratings).row_cs(5))
-blocks = ExplicitMF(n_factors=40)
+groups = ray.put(trainer.generate_indpendent_samples())
+scheduler = BlockScheduler.remote(trainer,multiprocessing.cpu_count()+1,3)
 results= ray.get([consumer.remote(scheduler) for _ in range(multiprocessing.cpu_count())])
 print("results",results)
 counter = ray.get(scheduler.get_update_counter.remote())

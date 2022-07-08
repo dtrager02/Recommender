@@ -23,98 +23,21 @@ import pandas as pd
 import numba
 import csr 
 import os.path
-class ExplicitMF():
+from Recommender import Recommender
+import ray
+
+@ray.remote
+class ExplicitMF(Recommender):
     def __init__(self,  
                  n_factors=40, 
                  alpha=0.005, 
                  beta1=.05,
                  beta2=.015):
-        """
-        Train a matrix factorization model to predict empty 
-        entries in a matrix. The terminology assumes a 
-        ratings matrix which is ~ user x item
-        
-        Params
-        ======
-        ratings : (ndarray)
-            User x Item matrix with corresponding ratings
-        
-        n_factors : (int)
-            Number of latent factors to use in matrix 
-            factorization model
-        
-        item_reg : (float)
-            Regularization term for item latent factors
-        
-        user_reg : (float)
-            Regularization term for user latent factors
-        
-        verbose : (bool)
-            Whether or not to printout training progress
-        """
-        
         self.n_factors = n_factors
         self.alpha = alpha
         self.beta1 = beta1
         self.beta2 = beta2
-        self.test_grid = np.zeros((9,9))
-    def link_db(self,path):
-        self.con = sqlite3.connect(path)
-        
-    def renumber_column(df:pd.Series,column:str):
-        all_values = df[column].unique()
-        all_values.sort()
-        #print(all_values)
-        converter = dict(zip(all_values,range(all_values.shape[0])))
-        df[column] = df[column].map(converter)
-        #print(sorted(df[column]))
-        return df
-    
-    def load_samples_from_sql(self,n):
-        try:
-            start = perf_counter()
-            self.samples = pd.read_sql(f"select username,anime_id,score from user_records order by username limit {n}",self.con)
-            print(f"Done loading samples in {perf_counter()-start} s.")
-            
-            self.samples = ExplicitMF.renumber_column(self.samples,"username")
-            self.samples = ExplicitMF.renumber_column(self.samples,"anime_id")
-            #np.random.shuffle(self.samples.values)
-            self.n_users = self.samples["username"].max() + 1
-            self.n_items = self.samples["anime_id"].max() + 1
-            drop_indices = np.random.choice(self.samples.index,size=int(self.samples.shape[0]/10),replace=False)
-            self.test_samples = self.samples.iloc[drop_indices,:]
-            self.samples = self.samples[~self.samples.index.isin(drop_indices)]
-            #self.train_samples = self.samples.iloc[0:int(self.samples.shape[0]*.8),:]
-            print(f"# of train samples: {self.samples.shape[0]}, # of test samples: {self.test_samples.shape[0]}")
-            # self.ratings = sparse.coo_matrix((self.samples["score"], (self.samples["username"], self.samples["anime_id"]))).tocsc().astype("float32")
-            # sparse.save_npz('sparse_matrix.npz', self.ratings)
-            # start = perf_counter()
-            # self.ratings = sparse.load_npz("sparse_matrix.npz")
-            
-            self.ratings = csr.CSR.from_coo(self.samples["username"].to_numpy(), self.samples["anime_id"].to_numpy(),self.samples["score"].to_numpy())
-            print(f"Done loading samples from npz file in {perf_counter()-start} s.")
-
-        except (Exception) as e:
-            print("No database loaded\n")
-            print(e.with_traceback())
-    #numba.float32[:,:](numba.float32[:,:],numba.float32[:,:],numba.float32[:,:],numba.float32,numba.typeof('a')) 
-    
-    def load_samples_from_npy(self,path,n):
-        start = perf_counter()
-        a = np.load(path)
-        a[:,2] *= 2 #adjusts ratings on a 5 pt scale to ints on a 10 pt scale
-        a = a.astype(np.int32) #makes it convertible to CSR
-        if n != "all":
-            a = a[:n] 
-        self.n_users = a[:,0].max() + 1
-        self.n_items = a[:,1].max() + 1
-        drop_indices = np.random.choice(a.shape[0],size=int(a.shape[0]/10),replace=False)
-        self.test_samples = a[drop_indices,:]
-        self.samples = np.delete(a,drop_indices,axis=0)
-
-        print(f"# of train samples: {self.samples.shape[0]}, # of test samples: {self.test_samples.shape[0]}")
-        self.ratings = csr.CSR.from_coo(self.samples[:,0], self.samples[:,1],self.samples[:,2])
-        print(f"Done loading samples from npz file in {perf_counter()-start} s.")
+        self.test_grid = np.zeros((9,9))    
         
     #@numba.njit(cache=True,,fastmath=True)
     # Initializing user-feature and movie-feature matrix 
@@ -148,7 +71,7 @@ class ExplicitMF():
         print("Test error = %.4f" % (ExplicitMF.mse(self.test_samples,self.P,self.Q,self.b_u,self.b_i,self.b)))
 
     # Stochastic gradient descent to get optimized P and Q matrix
-    #@numba.njit(cache=True,fastmath=True)
+    @numba.njit(cache=True,fastmath=True)
     def sgd(P,Q,b_u,b_i,b,y,
             samples,ratings:csr.CSR,
             alpha,beta1,beta2):
@@ -167,7 +90,7 @@ class ExplicitMF():
             P[user, :] +=alpha * (e *Q[item, :] - beta2 * P[user,:])
             Q[item, :] +=alpha * (e *P[user, :] - beta2 * Q[item,:])
   
-            y[rated_items,:] += alpha*(e/R_u*Q[rated_items,:]-beta2*y[rated_items,:])
+            y[rated_items,:] += alpha*(-1.0*beta2*y[rated_items,:]+e/R_u*Q[item,:])
             
         return P,Q,y,b_u,b_i
 
@@ -211,6 +134,10 @@ class ExplicitMF():
         for i in range(len(self.row_ranges)):
             row_groups = []
             for j in range(len(self.col_ranges)):
+                """self.col_ranges,self.row_ranges are in form [(a_0,b+0),(a_1,b_1)...] where a_n,b_n represents the span of rows/cols in the nth grid block
+                
+                The statements below select ratings that belong to each grid block based on that block's row/col ranges, and place them into a equally sized 2d array. In other words, if grid is 9x9, then all_groups is also 9x9
+                """
                 row_condition = np.logical_and(self.row_ranges[i][1]> self.samples[:,0], self.samples[:,0]>= self.row_ranges[i][0])
                 col_condition = np.logical_and(self.col_ranges[j][1]> self.samples[:,1], self.samples[:,1] >= self.col_ranges[j][0])
                 group_values = self.samples[np.logical_and(row_condition,col_condition)]
@@ -240,6 +167,7 @@ class ExplicitMF():
         
         self.samples[:,0] = pd.Series(self.samples[:,0]).map(self.row_converter).to_numpy()
         self.samples[:,1] = pd.Series(self.samples[:,1]).map(self.col_converter).to_numpy()
+        
     @numba.njit(cache=True)
     def add_users_to_sparse(user_data,ratings:csr.CSR):
         # print(self.ratings.colinds)
