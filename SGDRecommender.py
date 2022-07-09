@@ -24,6 +24,7 @@ import numba
 import csr 
 import os.path
 from Recommender import Recommender
+from SubSample import SubSample
 import ray
 
 @ray.remote
@@ -54,7 +55,7 @@ class ExplicitMF(Recommender):
         
         # Stochastic gradient descent for given number of iterations
         previous_mse = 0
-        for i in range(iters):
+        for i in range(1,iters+1):
             #np.random.shuffle(self.samples)
             sgd_time = perf_counter()
             self.P,self.Q,self.y,self.b_u,self.b_i = ExplicitMF.sgd(self.P,self.Q,self.b_u,self.b_i,self.b,self.y,self.samples,self.ratings,self.alpha,self.beta1,self.beta2)
@@ -71,6 +72,7 @@ class ExplicitMF(Recommender):
         print("Test error = %.4f" % (ExplicitMF.mse(self.test_samples,self.P,self.Q,self.b_u,self.b_i,self.b)))
 
     # Stochastic gradient descent to get optimized P and Q matrix
+    @staticmethod
     @numba.njit(cache=True,fastmath=True)
     def sgd(P,Q,b_u,b_i,b,y,
             samples,ratings:csr.CSR,
@@ -79,7 +81,7 @@ class ExplicitMF(Recommender):
             user = samples[i,0]
             item = samples[i,1]
             rated_items = ratings.row_cs(user)
-            R_u = np.sqrt(rated_items.shape[0])
+            R_u = np.sqrt(rated_items.shape[0])+1 #temporary division by 0 fix
             y_sum = np.sum(y[rated_items,:],axis=0)
             prediction = Q[item,:].dot((P[user, :]+y_sum/R_u).T) + b_u[user] + b_i[item] + b
             e = (samples[i,2]-prediction)
@@ -93,7 +95,7 @@ class ExplicitMF(Recommender):
             y[rated_items,:] += alpha*(-1.0*beta2*y[rated_items,:]+e/R_u*Q[item,:])
             
         return P,Q,y,b_u,b_i
-
+    @staticmethod
     @numba.njit(cache=True,parallel=True,fastmath=True)
     def mse(samples,P,Q,b_u,b_i,b): # samples format : user,item,rating
         test_errors = np.zeros(samples.shape[0])
@@ -106,6 +108,37 @@ class ExplicitMF(Recommender):
     
     def predict(row,col,user_vecs,item_vecs):
         return user_vecs[row, :].dot(item_vecs[col,:].T) 
+    
+    """
+    Execute upon receiving modified subsample
+    """
+    def update_params(self,subsample:SubSample):
+        row_range = self.row_ranges[subsample.block_pos[0]]
+        col_range = self.col_ranges[subsample.block_pos[1]]
+        self.P[row_range[0]:row_range[1]] = subsample.P
+        self.Q[col_range[0]:col_range[1]] = subsample.Q
+        self.b_u[row_range[0]:row_range[1]] = subsample.b_u
+        self.b_i[col_range[0]:col_range[1]] = subsample.b_i
+        self.y[col_range[0]:col_range[1]] = subsample.y
+        return subsample
+    
+    """
+    Execute to create a subsample for a grid block
+    """
+    def make_subsample(self,block_pos):
+        row_range = self.row_ranges[block_pos[0]]
+        col_range = self.col_ranges[block_pos[1]]
+        subsample = SubSample(block_pos,
+                              self.P[row_range[0]:row_range[1]],
+                              self.Q[col_range[0]:col_range[1]],
+                              self.b_u[row_range[0]:row_range[1]],
+                              self.b_i[col_range[0]:col_range[1]],
+                              self.b,
+                              self.y[col_range[0]:col_range[1]],
+                              self.alpha,
+                              self.beta1,
+                              self.beta2)  
+        return subsample 
     
     def get_chunk_breakpoints(self):
         # this is imprecise but works for at least 32 threads
@@ -128,8 +161,8 @@ class ExplicitMF(Recommender):
         return self.row_ranges,self.col_ranges
     
     def generate_indpendent_samples(self):
-        self.get_chunk_breakpoints()
         self.random_renumber_samples()
+        self.get_chunk_breakpoints()
         all_groups = []
         for i in range(len(self.row_ranges)):
             row_groups = []
@@ -161,12 +194,16 @@ class ExplicitMF(Recommender):
         self.samples[:,0] = pd.Series(self.samples[:,0]).map(self.row_converter).to_numpy()
         self.samples[:,1] = pd.Series(self.samples[:,1]).map(self.col_converter).to_numpy()
         
+        self.ratings = csr.CSR.from_coo(self.samples[:,0], self.samples[:,1],self.samples[:,2])
+        
     def unrandomize_samples(self):
         self.col_converter = dict(zip(self.col_converter.values(),self.col_converter.keys()))
         self.row_converter =  dict(zip(self.row_converter.values(),self.row_converter.keys()))
         
         self.samples[:,0] = pd.Series(self.samples[:,0]).map(self.row_converter).to_numpy()
         self.samples[:,1] = pd.Series(self.samples[:,1]).map(self.col_converter).to_numpy()
+        
+        self.ratings = csr.CSR.from_coo(self.samples[:,0], self.samples[:,1],self.samples[:,2])
         
     @numba.njit(cache=True)
     def add_users_to_sparse(user_data,ratings:csr.CSR):
@@ -223,6 +260,8 @@ class ExplicitMF(Recommender):
     def expirimental_setter(self,x,y):
         self.test_grid[x,y] += 1
         
+    def get_ratings(self):
+        return self.ratings
 
 if __name__ == "__main__":
 

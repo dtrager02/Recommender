@@ -10,31 +10,13 @@ import numpy as np
 import csr
 from multiprocessing import Process, Queue, Lock, Manager
 from collections import defaultdict
-
+from SubSample import SubSample
 from SGDRecommender import ExplicitMF
-
-"""
-Struct that will be serialized and sent to workers for processing
-"""
-class SubSample:
-    def __init__(self,block_pos:tuple,P,Q,b_u,b_i,b,y,
-                alpha,beta1,beta2) -> None:
-        self.block_pos = block_pos #used to get numpy array of samples in shared samples grid
-        self.P = P #this is a subset of P belonging to the users of the block
-        self.Q = Q
-        self.b_u=b_u
-        self.b_i=b_i
-        self.b=b
-        self.y=y
-        self.alpha=alpha
-        self.beta1=beta1
-        self.beta2=beta2
         
 @ray.remote
 class BlockScheduler:
-    def __init__(self,trainer:ExplicitMF,width,iters) -> None:
+    def __init__(self,width,iters) -> None:
         self.width = width
-        self.trainer = trainer
         self.n_threads = self.width -1
         temp = [0]*self.width
         self.update_counter = []
@@ -69,7 +51,7 @@ class BlockScheduler:
                     min = self.update_counter[i][j]
                     min_idx = (i,j)
         if min_idx != (-1,-1):
-            output = min_idx
+            output = min_idx # min_idx is the block_pos of subsample
             row_idx = self.unused_rows.index(min_idx[0])
             col_idx = self.unused_cols.index(min_idx[1])
             self.unused_cols.pop(col_idx)
@@ -103,38 +85,7 @@ class BlockScheduler:
             self.completed_rows.add(row)
         
         else:
-            self.unused_rows.append(row)
-            
-    def make_subsample(self,block_pos):
-        row_range = self.trainer.row_ranges[block_pos[0]]
-        col_range = self.trainer.col_ranges[block_pos[1]]
-        subsample = SubSample(block_pos,
-                              trainer.P[row_range[0]:row_range[1]],
-                              trainer.Q[col_range[0]:col_range[1]],
-                              trainer.b_u[row_range[0]:row_range[1]],
-                              trainer.b_i[col_range[0]:col_range[1]],
-                              trainer.b,
-                              trainer.y[col_range[0]:col_range[1]],
-                              trainer.alpha,
-                              trainer.beta1,
-                              trainer.beta2)  
-        return subsample
-    
-    def update_trainer(self,subsample):
-        row_range = self.trainer.row_ranges[block_pos[0]]
-        col_range = self.trainer.col_ranges[block_pos[1]]
-        subsample = SubSample(block_pos,
-                              trainer.P[row_range[0]:row_range[1]],
-                              trainer.Q[col_range[0]:col_range[1]],
-                              trainer.b_u[row_range[0]:row_range[1]],
-                              trainer.b_i[col_range[0]:col_range[1]],
-                              trainer.b,
-                              trainer.y[col_range[0]:col_range[1]],
-                              trainer.alpha,
-                              trainer.beta1,
-                              trainer.beta2)  
-        return subsample
-                            
+            self.unused_rows.append(row)                
         
     def get_update_counter(self):
         return self.update_counter
@@ -149,26 +100,30 @@ class BlockScheduler:
 
 # The consumer function takes data off of the Queue
 @ray.remote
-def consumer(scheduler : BlockScheduler):
+def consumer(scheduler : BlockScheduler,trainer: ExplicitMF, groups: list,ratings: csr.CSR):
     block = ray.get(scheduler.get_next.remote())
+    subsample = ray.get(trainer.make_subsample.remote(block))
     while True:
-        start = time.perf_counter()
-        time.sleep(1)
-        print(time.perf_counter()-start)
+        # start = time.perf_counter()
+        # time.sleep(1)
+        # print(time.perf_counter()-start)
+        print(subsample.block_pos,block)
+        time.sleep(random.random()/5.0)
+        block = ray.get(scheduler.get_next.remote(completed=subsample.block_pos))
         if block is None:
             return 1
-        time.sleep(random.random()/500.0)
-        block = ray.get(scheduler.get_next.remote(completed=(block[0],block[1])))
- 
+        subsample = ray.get(trainer.make_subsample.remote(block))
     
 
 scheduler = BlockScheduler.remote(multiprocessing.cpu_count()+1,3)
-# #scheduler will handle putting and retreiving items from queues
-trainer = ExplicitMF(n_factors=40)
-trainer.load_samples_from_npy("./movielense_27.npy",100000)
-groups = ray.put(trainer.generate_indpendent_samples())
-scheduler = BlockScheduler.remote(trainer,multiprocessing.cpu_count()+1,3)
-results= ray.get([consumer.remote(scheduler) for _ in range(multiprocessing.cpu_count())])
+trainer = ExplicitMF.remote(n_factors=40) #trainer is an actor so it can be writeable
+
+ray.get(trainer.load_samples_from_npy.remote("./movielense_27.npy",100000))
+groups = trainer.generate_indpendent_samples.remote() #groups are read-only in shared memmory
+ratings = trainer.get_ratings.remote()
+ray.get(trainer.train.remote(1))
+scheduler = BlockScheduler.remote(multiprocessing.cpu_count()+1,3)
+results= ray.get([consumer.remote(scheduler,trainer,groups,ratings) for _ in range(multiprocessing.cpu_count())])
 print("results",results)
 counter = ray.get(scheduler.get_update_counter.remote())
 print(counter)
