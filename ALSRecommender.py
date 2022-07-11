@@ -1,4 +1,4 @@
-#sbatch -N1 -n1 --gpus=1 --mem-per-gpu=8192 --ntasks=1 --cpus-per-task=16  --constraint=g start.sub
+#sbatch -N1 -n1 --mem-per-cpu=2048 --ntasks=1 --cpus-per-task=16 
 #sacct  --format="JobID,Elapsed,CPUTime,MaxRSS,AveRSS"
 #tail -f slurm-146258.out
 

@@ -9,11 +9,10 @@ import numba
 import numpy as np
 import csr
 import copy
-from multiprocessing import Process, Queue, Lock, Manager
 from collections import defaultdict
 from SubSample import SubSample
 from SGDRecommender import ExplicitMF
-        
+
 @ray.remote
 class BlockScheduler:
     def __init__(self,width,iters) -> None:
@@ -139,7 +138,6 @@ def consumer(scheduler : BlockScheduler,trainer: ExplicitMF, groups: list,rating
     count += 1
     print("Got first subsample",count)
     while True:
-        time.sleep(random.random()/5.0)
         """updating subsample with SGD results
         numpy arrays must be copied, otherwise they are read-only in shared storage
         """
@@ -164,15 +162,15 @@ def consumer(scheduler : BlockScheduler,trainer: ExplicitMF, groups: list,rating
         subsample = ray.get(trainer.make_subsample.remote(block))
         count += 1
         #print("Got subsample",count)
+n_threads = 8
+scheduler = BlockScheduler.remote(n_threads+1,4)
+trainer = ExplicitMF.remote(n_factors=80,n_threads=n_threads) #trainer is an actor so it can be writeable
 
-scheduler = BlockScheduler.remote(multiprocessing.cpu_count()+1,60)
-trainer = ExplicitMF.remote(n_factors=80) #trainer is an actor so it can be writeable
-
-ray.get(trainer.load_samples_from_npy.remote("./movielense_27.npy","all"))
+ray.get(trainer.load_samples_from_npy.remote("./movielense_27.npy",600000))
 groups = trainer.generate_indpendent_samples.remote() #groups are read-only in shared memmory
 ratings = trainer.get_ratings.remote()
 ray.get(trainer.train.remote(1,multithreaded=True))
-results= ray.get([consumer.remote(scheduler,trainer,groups,ratings) for _ in range(multiprocessing.cpu_count())])
+results= ray.get([consumer.remote(scheduler,trainer,groups,ratings) for _ in range(n_threads)])
 print("results",results)
 counter = ray.get(scheduler.get_update_counter.remote())
 print(counter)

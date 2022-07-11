@@ -50,7 +50,7 @@ class Recommender:
     def load_samples_from_npy(self,path,n):
         start = perf_counter()
         a = np.load(path)
-        a[:,2] *= 2 #adjusts ratings on a 5 pt scale to ints on a 10 pt scale
+        #a[:,2] *= 2 #adjusts ratings on a 5 pt scale to ints on a 10 pt scale
         a = a.astype(np.int32) #makes it convertible to CSR
         if n != "all":
             a = a[:n] 

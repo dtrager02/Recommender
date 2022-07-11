@@ -11,14 +11,12 @@ the content user matching system will include:
 2. release dates of items vs typical "era" of user
 3. popularity of user-rated items (how niche the user is)
 """
+from cgi import print_environ
+import multiprocessing
 import sys
-from numpy.linalg import solve
-from sklearn.metrics import mean_squared_error
 import numpy as np
 import scipy.sparse as sparse
-from scipy.sparse.linalg import spsolve
 from time import perf_counter
-import sqlite3
 import pandas as pd
 import numba
 import csr 
@@ -30,17 +28,20 @@ import ray
 @ray.remote
 class ExplicitMF(Recommender):
     def __init__(self,  
+                 n_threads = multiprocessing.cpu_count(),
                  n_factors=40, 
-                 alpha=0.01, 
+                 alpha=0.006, 
                  beta1=.05,
                  beta2=.015):
+        self.n_threads = n_threads
         self.n_factors = n_factors
         self.alpha = alpha
         self.beta1 = beta1
         self.beta2 = beta2
         self.test_grid = np.zeros((9,9))
         self.update_counter = 0
-        self.previous_mse = 0    
+        self.previous_mse = 0  
+        self.timestamp = perf_counter() 
         
     #@numba.njit(cache=True,,fastmath=True)
     # Initializing user-feature and movie-feature matrix 
@@ -102,14 +103,20 @@ class ExplicitMF(Recommender):
     @numba.njit(cache=True,fastmath=True)
     def mse(samples,ratings,P,Q,b_u,b_i,b,y): # samples format : user,item,rating
         test_errors = np.zeros(samples.shape[0])
-        for i in range(samples.shape[0]):
-            user = samples[i][0]
-            item = samples[i][1]
-            rated_items = ratings.row_cs(user)
-            R_u = np.sqrt(rated_items.shape[0])+1 #temporary division by 0 fix
-            y_sum = np.sum(y[rated_items,:],axis=0)
-            prediction = Q[item,:].dot((P[user, :]+0*(y_sum/R_u)).T) + b_u[user] + b_i[item] + b #temp ignore y
-            test_errors[i] = samples[i][2] - prediction
+        size = 100000
+        for i in range(0,samples.shape[0],size):
+            users = samples[i:i+size,0]
+            items = samples[i:i+size,1]
+            rated_items = []
+            R_u = np.empty(shape=len(users))
+            y_sum = np.empty(shape=(items.shape[0],P.shape[1]))
+            for j in range(len(users)):
+                rated_items.append(ratings.row_cs(users[j])) #size x n
+                R_u[j] = np.sqrt(rated_items[j].shape[0])+1 #temporary division by 0 fix
+                y_sum[j] = np.sum(y[rated_items[j],:],axis=0)
+            R_u = R_u.reshape((R_u.shape[0],1))
+            predictions = np.sum(Q[items,:]*(P[users, :]+0*(y_sum/R_u)),axis=1) + b_u[users] + b_i[items] + b #temp ignore y 
+            test_errors[i:i+size] = samples[i:i+size,2] - predictions
         return np.sqrt(np.sum(np.square(test_errors))/test_errors.shape[0])
     
     def predict(row,col,user_vecs,item_vecs):
@@ -132,6 +139,7 @@ class ExplicitMF(Recommender):
     Execute to create a subsample for a grid block
     """
     def make_subsample(self,block_pos):
+        print("Making block")
         row_range = self.row_ranges[block_pos[0]]
         col_range = self.col_ranges[block_pos[1]]
         subsample = SubSample(block_pos,
@@ -149,7 +157,7 @@ class ExplicitMF(Recommender):
     
     def get_chunk_breakpoints(self,debug=False):
         # this is imprecise but works for up to 32 threads
-        chunk_size = numba.config.NUMBA_DEFAULT_NUM_THREADS
+        chunk_size = self.n_threads
         #breakpoint = int(self.ratings.nnz/(chunk_size+1))+chunk_size
         u_breakpoint = int(self.n_users/(chunk_size+1))+1
         i_breakpoint = int(self.n_items/(chunk_size+1))+1
@@ -199,7 +207,8 @@ class ExplicitMF(Recommender):
                 group_values = self.samples[np.logical_and(row_condition,col_condition)]
                 row_groups.append(group_values)
             all_groups.append(row_groups)
-
+        self.samples = self.samples[self.samples[:, 0].argsort()] #sort samples after the grid creation in hopes of improving cache locality
+        self.test_samples = self.test_samples[self.test_samples[:, 0].argsort()]
         print("FPSG Grid Sample Shapes:")
         for i in all_groups:
             print([s.shape for s in i])
@@ -286,18 +295,28 @@ class ExplicitMF(Recommender):
     def get_ratings(self):
         return self.ratings
     
+    def geterrors(self,update_num):
+        print(f"Full grid update took {perf_counter()-self.timestamp} s.")
+        self.timestamp = perf_counter()
+        start = perf_counter()
+        print("Starting error calculation threads")
+        train_mse = self.mse(self.samples,self.ratings,self.P,self.Q,self.b_u,self.b_i,self.b,self.y)
+        test_mse = self.mse(self.test_samples,self.ratings,self.P,self.Q,self.b_u,self.b_i,self.b,self.y)
+        print("Iteration: %d ; train error = %.4f ; test error = %.4f ; lr = %.4f" % (update_num,train_mse,test_mse,self.alpha))
+        print(f"Calculated error in {perf_counter()-start} s.")
+        return train_mse
+    
     def increment(self):
         self.update_counter+= 1
-        update_number = self.update_counter/((numba.config.NUMBA_DEFAULT_NUM_THREADS+1)**2)
-        if self.update_counter % (((numba.config.NUMBA_DEFAULT_NUM_THREADS+1)**2 )*2)  == 0:
-            train_mse = self.mse(self.samples,self.ratings,self.P,self.Q,self.b_u,self.b_i,self.b,self.y)
-            test_mse = self.mse(self.test_samples,self.ratings,self.P,self.Q,self.b_u,self.b_i,self.b,self.y)
-            print("Iteration: %d ; train error = %.4f ; test error = %.4f ; lr = %.4f" % (update_number,train_mse,test_mse,self.alpha))
+        update_number = self.update_counter/((self.n_threads+1)**2)
+        if self.update_counter % (((self.n_threads+1)**2 )*1)  == 0:
+            train_mse = self.geterrors(update_number)
             if train_mse > self.previous_mse and self.previous_mse:
                 self.alpha*=.6
             else:
                 self.alpha*=1.06
             self.previous_mse = train_mse - .0001
+        return self.update_counter
 if __name__ == "__main__":
 
     if len(sys.argv) == 4:
@@ -311,5 +330,9 @@ if __name__ == "__main__":
     print(f"Using hyperparams: n_factors={MF_ALS.n_factors},alpha={MF_ALS.alpha},beta1={MF_ALS.beta1},beta2={MF_ALS.beta2}")
     
     MF_ALS.load_samples_from_npy("./movielense_27.npy",100000)
-    #MF_ALS.train(80,multithreaded=False)
-    grid = MF_ALS.generate_indpendent_samples()
+    MF_ALS.train(1,multithreaded=True)
+    #grid = MF_ALS.generate_indpendent_samples()
+    print(MF_ALS.samples.shape)
+    start = perf_counter()
+    print(MF_ALS.mse(MF_ALS.samples,MF_ALS.ratings,MF_ALS.P,MF_ALS.Q,MF_ALS.b_u,MF_ALS.b_i,MF_ALS.b,MF_ALS.y))
+    print(perf_counter()-start)
