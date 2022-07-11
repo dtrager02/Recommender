@@ -31,18 +31,20 @@ import ray
 class ExplicitMF(Recommender):
     def __init__(self,  
                  n_factors=40, 
-                 alpha=0.005, 
+                 alpha=0.01, 
                  beta1=.05,
                  beta2=.015):
         self.n_factors = n_factors
         self.alpha = alpha
         self.beta1 = beta1
         self.beta2 = beta2
-        self.test_grid = np.zeros((9,9))    
+        self.test_grid = np.zeros((9,9))
+        self.update_counter = 0
+        self.previous_mse = 0    
         
     #@numba.njit(cache=True,,fastmath=True)
     # Initializing user-feature and movie-feature matrix 
-    def train(self,iters):
+    def train(self,iters,multithreaded=True):
         self.P = np.random.normal(scale=1./self.n_factors, size=(self.n_users, self.n_factors)) #users
         self.Q = np.random.normal(scale=1./self.n_factors, size=(self.n_items, self.n_factors)) # items
         self.y = np.random.normal(scale=1./self.n_factors, size=(self.n_items, self.n_factors)) # implicit items
@@ -54,22 +56,23 @@ class ExplicitMF(Recommender):
         #all_groups = self.generate_indpendent_samples()
         
         # Stochastic gradient descent for given number of iterations
-        previous_mse = 0
-        for i in range(1,iters+1):
-            #np.random.shuffle(self.samples)
-            sgd_time = perf_counter()
-            self.P,self.Q,self.y,self.b_u,self.b_i = ExplicitMF.sgd(self.P,self.Q,self.b_u,self.b_i,self.b,self.y,self.samples,self.ratings,self.alpha,self.beta1,self.beta2)
-            print(f"SGD time: {perf_counter()-sgd_time}")
-            if i % 2:
-                train_mse = ExplicitMF.mse(self.samples,self.P,self.Q,self.b_u,self.b_i,self.b)
-                if train_mse > previous_mse and previous_mse:
-                    self.alpha*=.5
-                else:
-                    self.alpha*=1.05
-                print(f"Changed alpha to {self.alpha}")
-                previous_mse = train_mse - .0001
-                print("Iteration: %d ; train error = %.4f" % (i,train_mse))
-        print("Test error = %.4f" % (ExplicitMF.mse(self.test_samples,self.P,self.Q,self.b_u,self.b_i,self.b)))
+        if not multithreaded:
+            previous_mse = 0
+            for i in range(1,iters+1):
+                #np.random.shuffle(self.samples)
+                sgd_time = perf_counter()
+                self.P,self.Q,self.y,self.b_u,self.b_i = self.sgd(self.P,self.Q,self.b_u,self.b_i,self.b,self.y,self.samples,self.   ratings,self.alpha,self.beta1,self.beta2)
+                print(f"SGD time: {perf_counter()-sgd_time}")
+                if i % 2:
+                    train_mse = self.mse(self.samples,self.ratings,self.P,self.Q,self.b_u,self.b_i,self.b,self.y)
+                    if train_mse > previous_mse and previous_mse:
+                        self.alpha*=.5
+                    else:
+                        self.alpha*=1.05
+                    print(f"Changed alpha to {self.alpha}")
+                    previous_mse = train_mse - .0001
+                    print("Iteration: %d ; train error = %.4f" % (i,train_mse))
+            print("Test error = %.4f" % (self.mse(self.test_samples,self.ratings,self.P,self.Q,self.b_u,self.b_i,self.b,self.y)))
 
     # Stochastic gradient descent to get optimized P and Q matrix
     @staticmethod
@@ -96,13 +99,16 @@ class ExplicitMF(Recommender):
             
         return P,Q,y,b_u,b_i
     @staticmethod
-    @numba.njit(cache=True,parallel=True,fastmath=True)
-    def mse(samples,P,Q,b_u,b_i,b): # samples format : user,item,rating
+    @numba.njit(cache=True,fastmath=True)
+    def mse(samples,ratings,P,Q,b_u,b_i,b,y): # samples format : user,item,rating
         test_errors = np.zeros(samples.shape[0])
-        for i in numba.prange(samples.shape[0]):
+        for i in range(samples.shape[0]):
             user = samples[i][0]
             item = samples[i][1]
-            prediction = prediction = P[user, :].dot(Q[item,:].T) + b_u[user] + b_i[item] + b
+            rated_items = ratings.row_cs(user)
+            R_u = np.sqrt(rated_items.shape[0])+1 #temporary division by 0 fix
+            y_sum = np.sum(y[rated_items,:],axis=0)
+            prediction = Q[item,:].dot((P[user, :]+0*(y_sum/R_u)).T) + b_u[user] + b_i[item] + b #temp ignore y
             test_errors[i] = samples[i][2] - prediction
         return np.sqrt(np.sum(np.square(test_errors))/test_errors.shape[0])
     
@@ -119,7 +125,7 @@ class ExplicitMF(Recommender):
         self.Q[col_range[0]:col_range[1]] = subsample.Q
         self.b_u[row_range[0]:row_range[1]] = subsample.b_u
         self.b_i[col_range[0]:col_range[1]] = subsample.b_i
-        self.y[col_range[0]:col_range[1]] = subsample.y
+        #self.y[col_range[0]:col_range[1]] = subsample.y[col_range[0]:col_range[1]]#temporary
         return subsample
     
     """
@@ -129,40 +135,57 @@ class ExplicitMF(Recommender):
         row_range = self.row_ranges[block_pos[0]]
         col_range = self.col_ranges[block_pos[1]]
         subsample = SubSample(block_pos,
+                              (row_range[0],col_range[0]),
                               self.P[row_range[0]:row_range[1]],
                               self.Q[col_range[0]:col_range[1]],
                               self.b_u[row_range[0]:row_range[1]],
                               self.b_i[col_range[0]:col_range[1]],
                               self.b,
-                              self.y[col_range[0]:col_range[1]],
+                              self.y, #[col_range[0]:col_range[1]] temporarily removed
                               self.alpha,
                               self.beta1,
                               self.beta2)  
         return subsample 
     
-    def get_chunk_breakpoints(self):
-        # this is imprecise but works for at least 32 threads
+    def get_chunk_breakpoints(self,debug=False):
+        # this is imprecise but works for up to 32 threads
         chunk_size = numba.config.NUMBA_DEFAULT_NUM_THREADS
-        breakpoint = int(self.ratings.nnz/(chunk_size+1))+chunk_size 
+        #breakpoint = int(self.ratings.nnz/(chunk_size+1))+chunk_size
+        u_breakpoint = int(self.n_users/(chunk_size+1))+1
+        i_breakpoint = int(self.n_items/(chunk_size+1))+1
+        u_offset, i_offset = 0, 0
         self.row_ranges,self.col_ranges = [],[]
-        offset = 0
-        previous_index = 0
-        for i in range(len(self.ratings.rowptrs)):
-            if self.ratings.rowptrs[i] -offset > breakpoint:
-                self.row_ranges.append((previous_index,i))
-                previous_index = i
-                offset+=breakpoint
-        self.row_ranges.append((previous_index,len(self.ratings.rowptrs)))
-        col_breakpoints = list(range(0,self.n_items,int(self.n_items/(chunk_size+1))+chunk_size))
-        for i in range(len(col_breakpoints)-1):
-            self.col_ranges.append((col_breakpoints[i],col_breakpoints[i+1]))
-        self.col_ranges.append((col_breakpoints[-1],col_breakpoints[-1]+int(self.n_items/chunk_size)))
+        for _ in range(chunk_size):
+            self.row_ranges.append((u_offset,u_offset+u_breakpoint))
+            self.col_ranges.append((i_offset,i_offset+i_breakpoint))
+            i_offset+= i_breakpoint
+            u_offset+= u_breakpoint
+        self.row_ranges.append((u_offset,self.n_users))
+        self.col_ranges.append((i_offset,self.n_items))
+        """Redundant code"""
+        # self.row_ranges,self.col_ranges = [],[]
+        # offset = 0
+        # previous_index = 0
+        # for i in range(len(self.ratings.rowptrs)):
+        #     if self.ratings.rowptrs[i] -offset > breakpoint:
+        #         self.row_ranges.append((previous_index,i))
+        #         previous_index = i
+        #         offset+=breakpoint
+        # self.row_ranges.append((previous_index,len(self.ratings.rowptrs)))
+        # col_breakpoints = list(range(0,self.n_items,int(self.n_items/(chunk_size+1))+chunk_size))
+        # for i in range(len(col_breakpoints)-1):
+        #     self.col_ranges.append((col_breakpoints[i],col_breakpoints[i+1]))
+        # self.col_ranges.append((col_breakpoints[-1],col_breakpoints[-1]+int(self.n_items/chunk_size)))
         print("Shape of FPSGD grid:",len(self.row_ranges),len(self.col_ranges))
+        if debug:
+            print(f"n_users,n_items = {self.n_users},{self.n_items}")
+            print("row ranges:",self.row_ranges)
+            print("col ranges:",self.col_ranges)
         return self.row_ranges,self.col_ranges
     
     def generate_indpendent_samples(self):
         self.random_renumber_samples()
-        self.get_chunk_breakpoints()
+        self.get_chunk_breakpoints(debug=False) #change this for more verbosity
         all_groups = []
         for i in range(len(self.row_ranges)):
             row_groups = []
@@ -262,7 +285,19 @@ class ExplicitMF(Recommender):
         
     def get_ratings(self):
         return self.ratings
-
+    
+    def increment(self):
+        self.update_counter+= 1
+        update_number = self.update_counter/((numba.config.NUMBA_DEFAULT_NUM_THREADS+1)**2)
+        if self.update_counter % (((numba.config.NUMBA_DEFAULT_NUM_THREADS+1)**2 )*2)  == 0:
+            train_mse = self.mse(self.samples,self.ratings,self.P,self.Q,self.b_u,self.b_i,self.b,self.y)
+            test_mse = self.mse(self.test_samples,self.ratings,self.P,self.Q,self.b_u,self.b_i,self.b,self.y)
+            print("Iteration: %d ; train error = %.4f ; test error = %.4f ; lr = %.4f" % (update_number,train_mse,test_mse,self.alpha))
+            if train_mse > self.previous_mse and self.previous_mse:
+                self.alpha*=.6
+            else:
+                self.alpha*=1.06
+            self.previous_mse = train_mse - .0001
 if __name__ == "__main__":
 
     if len(sys.argv) == 4:
@@ -272,9 +307,9 @@ if __name__ == "__main__":
         beta2 = float(sys.argv[4])
         MF_ALS = ExplicitMF(n_factors=n_factors, alpha=alpha, beta1=beta1, beta2=beta2)
     else:
-        MF_ALS = ExplicitMF(n_factors=30)
+        MF_ALS = ExplicitMF(n_factors=40)
     print(f"Using hyperparams: n_factors={MF_ALS.n_factors},alpha={MF_ALS.alpha},beta1={MF_ALS.beta1},beta2={MF_ALS.beta2}")
     
     MF_ALS.load_samples_from_npy("./movielense_27.npy",100000)
-    MF_ALS.train(80)
-    #grid = MF_ALS.generate_indpendent_samples()
+    #MF_ALS.train(80,multithreaded=False)
+    grid = MF_ALS.generate_indpendent_samples()

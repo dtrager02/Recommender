@@ -8,6 +8,7 @@ import ray
 import numba
 import numpy as np
 import csr
+import copy
 from multiprocessing import Process, Queue, Lock, Manager
 from collections import defaultdict
 from SubSample import SubSample
@@ -44,22 +45,24 @@ class BlockScheduler:
         if not len(self.unused_cols):
             return None
         min = 10**10
-        min_idx = (-1,-1)
+        min_idx = []
         for i in self.unused_rows:
             for j in self.unused_cols:
                 if self.update_counter[i][j] <min and self.update_counter[i][j] <self.iters:
                     min = self.update_counter[i][j]
-                    min_idx = (i,j)
-        if min_idx != (-1,-1):
-            output = min_idx # min_idx is the block_pos of subsample
-            row_idx = self.unused_rows.index(min_idx[0])
-            col_idx = self.unused_cols.index(min_idx[1])
+                    min_idx = [(i,j)]
+                elif self.update_counter[i][j] == min and self.update_counter[i][j] <self.iters:
+                    min_idx.append((i,j))
+        if len(min_idx):
+            output = random.choice(min_idx) # min_idx is the block_pos of subsample. we pick randomly to mimick true SGD
+            row_idx = self.unused_rows.index(output[0])
+            col_idx = self.unused_cols.index(output[1])
             self.unused_cols.pop(col_idx)
             self.unused_rows.pop(row_idx)
         else:
             output = None
         return output
-            
+
     def completed_chunk(self,idx):
         self.test += 1
         row = idx[0]
@@ -96,33 +99,79 @@ class BlockScheduler:
     def __self__(self):
         return self
     
-    
+@numba.njit(cache=True,fastmath=True)
+def sgd(idx_offset,P,Q,b_u,b_i,b,y,
+        samples,ratings:csr.CSR,
+        alpha,beta1,beta2):
+    #adjust for the offset in row/col indexes for this block
+    #"0*" are my way of ignoring a variable
+    samples = np.copy(samples) # avoiding read-only
+    samples[:,0] -= idx_offset[0]
+    samples[:,1] -= idx_offset[1]
+    for i in range(samples.shape[0]):
+        user = samples[i,0]
+        item = samples[i,1]
+        rated_items = ratings.row_cs(user)
+        R_u = np.sqrt(rated_items.shape[0])+1 #temporary division by 0 fix
+        y_sum = np.sum(y[rated_items,:],axis=0)
+        prediction = Q[item,:].dot((P[user, :]+0*(y_sum/R_u)).T) + b_u[user] + b_i[item] + b
+        e = (samples[i,2]-prediction)
+        
+        b_u[user] += alpha * (e - beta1 * b_u[user])
+        b_i[item] += alpha * (e - beta1 * b_i[item])
+        
+        P[user, :] +=alpha * (e *Q[item, :] - beta2 * P[user,:])
+        Q[item, :] +=alpha * (e *(P[user, :]+(y_sum/np.sqrt(P.shape[0]))*0) - beta2 * Q[item,:])
+
+        y[rated_items,:] += alpha*(-1.0*beta2*y[rated_items,:]+e/R_u*Q[item,:])
+        
+    return P,Q,y,b_u,b_i
 
 # The consumer function takes data off of the Queue
 @ray.remote
 def consumer(scheduler : BlockScheduler,trainer: ExplicitMF, groups: list,ratings: csr.CSR):
-    block = ray.get(scheduler.get_next.remote())
-    subsample = ray.get(trainer.make_subsample.remote(block))
+    count = 0
+    print(len(groups))
+    print(ratings.nnz)
+    print(groups[0][1].shape)
+    block = scheduler.get_next.remote() #returns tuple representing grid block
+    subsample = ray.get(trainer.make_subsample.remote(block)) #gets params related to that grid block
+    count += 1
+    print("Got first subsample",count)
     while True:
-        # start = time.perf_counter()
-        # time.sleep(1)
-        # print(time.perf_counter()-start)
-        print(subsample.block_pos,block)
         time.sleep(random.random()/5.0)
+        """updating subsample with SGD results
+        numpy arrays must be copied, otherwise they are read-only in shared storage
+        """
+        subsample = copy.deepcopy(subsample)
+        subsample.P,subsample.Q,subsample.y,subsample.b_u,subsample.b_i = \
+        sgd(subsample.idx_offset,
+            np.copy(subsample.P), 
+            np.copy(subsample.Q),
+            np.copy(subsample.b_u),
+            np.copy(subsample.b_i),
+            subsample.b,
+            np.copy(subsample.y),
+            groups[subsample.block_pos[0]][subsample.block_pos[1]],ratings,
+            subsample.alpha,subsample.beta1,subsample.beta2)
+        trainer.update_params.remote(
+            subsample
+            ) #this redundant copy is to prevent using object storage for SGD output
+        trainer.increment.remote()
         block = ray.get(scheduler.get_next.remote(completed=subsample.block_pos))
-        if block is None:
+        if block is None: # as long as training takes longer than 1s, first block cannot be none
             return 1
         subsample = ray.get(trainer.make_subsample.remote(block))
-    
+        count += 1
+        #print("Got subsample",count)
 
-scheduler = BlockScheduler.remote(multiprocessing.cpu_count()+1,3)
-trainer = ExplicitMF.remote(n_factors=40) #trainer is an actor so it can be writeable
+scheduler = BlockScheduler.remote(multiprocessing.cpu_count()+1,60)
+trainer = ExplicitMF.remote(n_factors=80) #trainer is an actor so it can be writeable
 
-ray.get(trainer.load_samples_from_npy.remote("./movielense_27.npy",100000))
+ray.get(trainer.load_samples_from_npy.remote("./movielense_27.npy","all"))
 groups = trainer.generate_indpendent_samples.remote() #groups are read-only in shared memmory
 ratings = trainer.get_ratings.remote()
-ray.get(trainer.train.remote(1))
-scheduler = BlockScheduler.remote(multiprocessing.cpu_count()+1,3)
+ray.get(trainer.train.remote(1,multithreaded=True))
 results= ray.get([consumer.remote(scheduler,trainer,groups,ratings) for _ in range(multiprocessing.cpu_count())])
 print("results",results)
 counter = ray.get(scheduler.get_update_counter.remote())
