@@ -101,9 +101,13 @@ class ExplicitMF(Recommender):
         return P,Q,y,b_u,b_i
     @staticmethod
     @numba.njit(cache=True,fastmath=True)
-    def mse(samples,ratings,P,Q,b_u,b_i,b,y): # samples format : user,item,rating
+    def mse(samples,ratings,P,Q,b_u,b_i,b,y,exact=False): # samples format : user,item,rating
+        if not exact:
+            dropsize = int(samples.shape[0]/10) if samples.shape[0]<100000 else 100000
+            drop_indices = np.random.choice(samples.shape[0],size=dropsize,replace=False)
+        samples = samples[drop_indices,:]
         test_errors = np.zeros(samples.shape[0])
-        size = 100000
+        size = 1000
         for i in range(0,samples.shape[0],size):
             users = samples[i:i+size,0]
             items = samples[i:i+size,1]
@@ -139,7 +143,6 @@ class ExplicitMF(Recommender):
     Execute to create a subsample for a grid block
     """
     def make_subsample(self,block_pos):
-        print("Making block")
         row_range = self.row_ranges[block_pos[0]]
         col_range = self.col_ranges[block_pos[1]]
         subsample = SubSample(block_pos,

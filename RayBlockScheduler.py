@@ -144,12 +144,12 @@ def consumer(scheduler : BlockScheduler,trainer: ExplicitMF, groups: list,rating
         subsample = copy.deepcopy(subsample)
         subsample.P,subsample.Q,subsample.y,subsample.b_u,subsample.b_i = \
         sgd(subsample.idx_offset,
-            np.copy(subsample.P), 
-            np.copy(subsample.Q),
-            np.copy(subsample.b_u),
-            np.copy(subsample.b_i),
+            subsample.P, 
+            subsample.Q,
+            subsample.b_u,
+            subsample.b_i,
             subsample.b,
-            np.copy(subsample.y),
+            subsample.y,
             groups[subsample.block_pos[0]][subsample.block_pos[1]],ratings,
             subsample.alpha,subsample.beta1,subsample.beta2)
         trainer.update_params.remote(
